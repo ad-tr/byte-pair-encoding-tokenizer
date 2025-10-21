@@ -1,4 +1,6 @@
 import regex as re
+import pickle
+from pathlib import Path
 
 class BytePairEncoder:
   def __init__(self):
@@ -40,7 +42,19 @@ class BytePairEncoder:
   def decode(self, ids):
     tokens = b"".join(self.vocab[idx] for idx in ids)
     return tokens.decode("utf-8")
-
+  
+  def save(self, file_name):
+    path = Path(__file__).resolve().parents[1] / "data" / file_name
+    with open(path, "wb") as f:
+      pickle.dump(self.vocab, f)
+    print(f"Vocab sauvegardé avec succès dans {path}")
+      
+  def load(self, file_name):
+    path = Path(__file__).resolve().parents[1] / "data" / file_name
+    with open(path, "rb") as f:
+      self.vocab = pickle.load(f)
+    print(f"Vocab chargé avec succès depuis {path}")
+    
   def _merge(self, ids, pair ,idx):
     new_ids = []
     for word in ids:
