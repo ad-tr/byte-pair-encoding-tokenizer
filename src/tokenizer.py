@@ -8,24 +8,20 @@ class BytePairEncoder:
     self.vocab = {}
     
   def train(self, text, vocab_size):
+    if vocab_size < 257:
+      print("Veuilez indiquer une taille de vocabulaire supérieure à 256 (chars unicode déjà présents)")
+      return
     num_merges = vocab_size - 256
     merges = {}
     current_ids = self._text_to_bytes(text)
-
     for i in range(num_merges):
       stats = self._get_stats(current_ids)
       top_pair = max(stats, key=stats.get)
 
       merges[top_pair] = 256 + i
       current_ids = self._merge(current_ids, top_pair, 256 + i)
-    
     self.merges = merges
-    
-    vocab = {idx: bytes([idx]) for idx in range(256)}
-    for (p0, p1), idx in self.merges.items():
-        vocab[idx] = vocab[p0] + vocab[p1]
-
-    self.vocab = vocab
+    self._create_vocab_with_merges()
 
   def encode(self, text):
     tokens = self._text_to_bytes(text)
@@ -46,14 +42,16 @@ class BytePairEncoder:
   def save(self, file_name):
     path = Path(__file__).resolve().parents[1] / "data" / file_name
     with open(path, "wb") as f:
-      pickle.dump(self.vocab, f)
-    print(f"Vocab sauvegardé avec succès dans {path}")
+      pickle.dump(self.merges, f)
+    print(f"Merges sauvegardé avec succès dans {path}")
       
   def load(self, file_name):
     path = Path(__file__).resolve().parents[1] / "data" / file_name
     with open(path, "rb") as f:
-      self.vocab = pickle.load(f)
-    print(f"Vocab chargé avec succès depuis {path}")
+      self.merges = pickle.load(f)
+    self._create_vocab_with_merges()
+    print(f"Merges chargé avec succès depuis {path}")
+    print("Vocab mis a jour avec succès")
     
   def _merge(self, ids, pair ,idx):
     new_ids = []
@@ -82,3 +80,9 @@ class BytePairEncoder:
         for pair in zip(item, item[1:]):
           counts[pair] = counts.get(pair, 0) + 1
     return counts
+  
+  def _create_vocab_with_merges(self):
+    vocab = {idx: bytes([idx]) for idx in range(256)}
+    for (p0, p1), idx in self.merges.items():
+        vocab[idx] = vocab[p0] + vocab[p1]
+    self.vocab = vocab
