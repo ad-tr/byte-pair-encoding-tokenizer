@@ -1,14 +1,22 @@
 from tokenizer import BytePairEncoder
 
+# Utilisation générale
 BPE = BytePairEncoder()
-text = "Ceci est un exemple de texte à encoder avec le Byte Pair Encoding. Le BPE est une technique de tokenization efficace."
-train = BPE.train(text, 310)
+with open("./data/wikipedia-fr-sample.txt", "r") as f:
+    text = f.read()
 
-test = "Ceci est un test de tokenization."
+## Nous definissons le nombre de tokens que nous voulons dans notre vocabulaire.
+BPE.train(text, 400)
+## Ensuite, nous pouvons sauvegarder les merges qui ont été effectués dans un fichier pickle.
+BPE.save("merges.pkl")
+## Pour la prochaine fois je pourrais utiliser BPE.load("merges.pkl") sans devoir utiliser BPE.train()
 
+## Test d'encode et de decode
+test = "Ceci est un mistral venant du nord et traversant le sud, il est chaud et lourd."
 test_ids = BPE.encode(test)
-for i in range(len(test_ids)):
-    print(f"Token ID: {test_ids[i]}, Byte Sequence: {BPE.decode([test_ids[i]])}")
-    
 print("Test Encoded IDs:", test_ids)
 print("Test Decoded Text:", BPE.decode(test_ids))
+print(f"Le ratio de compression est de: {len(test_ids)/len(test)}")
+
+
+
