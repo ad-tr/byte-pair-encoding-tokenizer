@@ -5,12 +5,11 @@ from pathlib import Path
 class BytePairEncoder:
   def __init__(self):
     self.merges = {}
-    self.vocab = {}
+    self.vocab = {idx: bytes([idx]) for idx in range(256)}
     
   def train(self, text, vocab_size):
     if vocab_size < 257:
-      print("Veuilez indiquer une taille de vocabulaire supérieure à 256 (chars unicode déjà présents)")
-      return
+      raise ValueError("La taille du vocabulaire doit être supérieure à 256")
     num_merges = vocab_size - 256
     merges = {}
     current_ids = self._text_to_bytes(text)
@@ -25,17 +24,15 @@ class BytePairEncoder:
 
   def encode(self, text):
     tokens = self._text_to_bytes(text)
-    merges = self.merges
-    while len(tokens) >= 2:
-        stats = self._get_stats(tokens)
-        pair = min(stats, key=lambda p: merges.get(p, float("inf")))
-        if pair not in merges:
-            break
-        idx = merges[pair]
-        tokens = self._merge(tokens, pair, idx)
+    for pair, idx in sorted(self.merges.items(), key=lambda x: x [1]):
+      tokens = self._merge(tokens, pair, idx)
+        
     return [token for sublists in tokens for token in sublists]
 
   def decode(self, ids):
+    for id in ids:
+      if id not in self.vocab:
+        raise ValueError(f"{id} n'existe pas dans le vocabulaire")
     tokens = b"".join(self.vocab[idx] for idx in ids)
     return tokens.decode("utf-8")
   
