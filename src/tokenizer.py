@@ -3,11 +3,21 @@ import pickle
 from pathlib import Path
 
 class BytePairEncoder:
+  """Byte-Pair Encoding algorithm."""
+  
   def __init__(self):
     self.merges = {}
     self.vocab = {idx: bytes([idx]) for idx in range(256)}
+    self.stats = {}
     
   def train(self, text, vocab_size):
+    """
+    Train the BPE tokenizer from scratch.
+
+    Args:
+        text (str): The training text.
+        vocab_size (int): The desired vocabulary size (give a value up to 256).
+    """
     if vocab_size < 257:
       raise ValueError("La taille du vocabulaire doit être supérieure à 256")
     num_merges = vocab_size - 256
@@ -15,14 +25,27 @@ class BytePairEncoder:
     current_ids = self._text_to_bytes(text)
     for i in range(num_merges):
       stats = self._get_stats(current_ids)
-      top_pair = max(stats, key=stats.get)
-
+      try: 
+        top_pair = max(stats, key=stats.get)
+      except Exception as e:
+        if "max()" in str(e) and "empty" in str(e):
+          raise ValueError("Error: La taille du texte d'entrainement est trop petite pour atteindre le vocabulaire demandé")
       merges[top_pair] = 256 + i
       current_ids = self._merge(current_ids, top_pair, 256 + i)
+    
     self.merges = merges
     self._create_vocab_with_merges()
 
   def encode(self, text):
+    """
+    Encode the input model into a list of IDs
+
+    Args:
+        text (str): The text to encode.
+        
+    Returns:
+        int[]: List of token IDs.
+    """
     tokens = self._text_to_bytes(text)
     for pair, idx in sorted(self.merges.items(), key=lambda x: x [1]):
       tokens = self._merge(tokens, pair, idx)
@@ -30,6 +53,15 @@ class BytePairEncoder:
     return [token for sublists in tokens for token in sublists]
 
   def decode(self, ids):
+    """
+    Decode the IDs give in input into string
+
+    Args:
+        ids (int[]): A list of tokens created with encode()
+    
+    Returns:
+        str: The decoded text.
+    """
     for id in ids:
       if id not in self.vocab:
         raise ValueError(f"{id} n'existe pas dans le vocabulaire")
@@ -37,13 +69,25 @@ class BytePairEncoder:
     return tokens.decode("utf-8")
   
   def save(self, file_name):
-    path = Path(__file__).resolve().parents[1] / "data" / file_name
+    """
+    Save the learned merges to a file with .pkl extension in ./data/save/.
+    
+    Args:
+        file_name (str): The name of the file with .pkl (Example: "merges.pkl")
+    """
+    path = Path(__file__).resolve().parents[1] / "data" / "save" / file_name
     with open(path, "wb") as f:
       pickle.dump(self.merges, f)
     print(f"Merges sauvegardé avec succès dans {path}")
       
   def load(self, file_name):
-    path = Path(__file__).resolve().parents[1] / "data" / file_name
+    """
+    Load previously saved merges from a .pkl file.
+
+    Args:
+        file_name (str): The name of the file with .pkl (Example: "merges.pkl")
+    """
+    path = Path(__file__).resolve().parents[1] / "data" / "save" / file_name
     with open(path, "rb") as f:
       self.merges = pickle.load(f)
     self._create_vocab_with_merges()
@@ -51,6 +95,17 @@ class BytePairEncoder:
     print("Vocab mis a jour avec succès")
     
   def _merge(self, ids, pair ,idx):
+    """
+    Merge all occurrences of a token pair into a new token.
+
+    Args:
+        ids (int[][]): List of lists of IDs representing tokenized words.
+        pair ((int, int)): The pair of tokens to replace.
+        idx (int): The ID of the new token that replaces the pair.
+    
+    Returns:
+        int[][]: Updated IDs after merging.
+    """
     new_ids = []
     for word in ids:
       new_sub_ids = []
@@ -66,12 +121,30 @@ class BytePairEncoder:
     return new_ids
     
   def _text_to_bytes(self, text):
+    """
+    Convert text into a list of lists of byte IDs using the GPT-2 pattern.
+
+    Args:
+        text (str): The text to convert.
+    
+    Returns:
+        int[][]: List of lists of byte IDs for each text segment.
+    """
     gpt2pat = re.compile(r"""\[speaker\d{3}:\]| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
     splited_text = re.findall(gpt2pat, text)
     ids = [list(map(int, item.encode('utf-8'))) for item in splited_text]
     return ids
         
   def _get_stats(self, ids):
+    """
+    Calculate frequency statistics for all consecutive token pairs.
+
+    Args:
+        ids (int[][]): List of lists of IDs representing tokens.
+    
+    Returns:
+        dict: Dictionary with pairs as keys and their frequencies as values.
+    """
     counts = {}
     for item in ids:
         for pair in zip(item, item[1:]):
@@ -79,6 +152,11 @@ class BytePairEncoder:
     return counts
   
   def _create_vocab_with_merges(self):
+    """
+    Rebuild the complete vocabulary by applying all learned merges.
+    
+    Updates self.vocab with the new tokens created by the merges.
+    """
     vocab = {idx: bytes([idx]) for idx in range(256)}
     for (p0, p1), idx in self.merges.items():
         vocab[idx] = vocab[p0] + vocab[p1]

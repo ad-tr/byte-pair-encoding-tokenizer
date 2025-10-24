@@ -1,0 +1,3363 @@
+"""Configuration management setup
+
+Some terminology:
+- name
+  As written in config files.
+- value
+  Value associated with a name
+- key
+  Name combined with it's section (section.name)
+- variant
+  A single word describing where the configuration key-value pair came from
+"""
+
+import configparser
+import locale
+import os
+import sys
+from typing import Any, Dict, Iterable, List, NewType, Optional, Tuple
+
+from pip._internal.exceptions import (
+    ConfigurationError,
+    ConfigurationFileCouldNotBeLoaded,
+)
+from pip._internal.utils import appdirs
+from pip._internal.utils.compat import WINDOWS
+from pip._internal.utils.logging import getLogger
+from pip._internal.utils.misc import ensure_dir, enum
+
+RawConfigParser = configparser.RawConfigParser  # Shorthand
+Kind = NewType("Kind", str)
+
+CONFIG_BASENAME = "pip.ini" if WINDOWS else "pip.conf"
+ENV_NAMES_IGNORED = "version", "help"
+
+# The kinds of configurations there are.
+kinds = enum(
+    USER="user",  # User Specific
+    GLOBAL="global",  # System Wide
+    SITE="site",  # [Virtual] Environment Specific
+    ENV="env",  # from PIP_CONFIG_FILE
+    ENV_VAR="env-var",  # from Environment Variables
+)
+OVERRIDE_ORDER = kinds.GLOBAL, kinds.USER, kinds.SITE, kinds.ENV, kinds.ENV_VAR
+VALID_LOAD_ONLY = kinds.USER, kinds.GLOBAL, kinds.SITE
+
+logger = getLogger(__name__)
+
+
+# NOTE: Maybe use the optionx attribute to normalize keynames.
+def _normalize_name(name: str) -> str:
+    """Make a name consistent regardless of source (environment or file)"""
+    name = name.lower().replace("_", "-")
+    if name.startswith("--"):
+        name = name[2:]  # only prefer long opts
+    return name
+
+
+def _disassemble_key(name: str) -> List[str]:
+    if "." not in name:
+        error_message = (
+            "Key does not contain dot separated section and key. "
+            f"Perhaps you wanted to use 'global.{name}' instead?"
+        )
+        raise ConfigurationError(error_message)
+    return name.split(".", 1)
+
+
+def get_configuration_files() -> Dict[Kind, List[str]]:
+    global_config_files = [
+        os.path.join(path, CONFIG_BASENAME) for path in appdirs.site_config_dirs("pip")
+    ]
+
+    site_config_file = os.path.join(sys.prefix, CONFIG_BASENAME)
+    legacy_config_file = os.path.join(
+        os.path.expanduser("~"),
+        "pip" if WINDOWS else ".pip",
+        CONFIG_BASENAME,
+    )
+    new_config_file = os.path.join(appdirs.user_config_dir("pip"), CONFIG_BASENAME)
+    return {
+        kinds.GLOBAL: global_config_files,
+        kinds.SITE: [site_config_file],
+        kinds.USER: [legacy_config_file, new_config_file],
+    }
+
+
+class Configuration:
+    """Handles management of configuration.
+
+    Provides an interface to accessing and managing configuration files.
+
+    This class converts provides an API that takes "section.key-name" style
+    keys and stores the value associated with it as "key-name" under the
+    section "section".
+
+    This allows for a clean interface wherein the both the section and the
+    key-name are preserved in an easy to manage form in the configuration files
+    and the data stored is also nice.
+    """
+
+    def __init__(self, isolated: bool, load_only: Optional[Kind] = None) -> None:
+        super().__init__()
+
+        if load_only is not None and load_only not in VALID_LOAD_ONLY:
+            raise ConfigurationError(
+                "Got invalid value for load_only - should be one of {}".format(
+                    ", ".join(map(repr, VALID_LOAD_ONLY))
+                )
+            )
+        self.isolated = isolated
+        self.load_only = load_only
+
+        # Because we keep track of where we got the data from
+        self._parsers: Dict[Kind, List[Tuple[str, RawConfigParser]]] = {
+            variant: [] for variant in OVERRIDE_ORDER
+        }
+        self._config: Dict[Kind, Dict[str, Any]] = {
+            variant: {} for variant in OVERRIDE_ORDER
+        }
+        self._modified_parsers: List[Tuple[str, RawConfigParser]] = []
+
+    def load(self) -> None:
+        """Loads configuration from configuration files and environment"""
+        self._load_config_files()
+        if not self.isolated:
+            self._load_environment_vars()
+
+    def get_file_to_edit(self) -> Optional[str]:
+        """Returns the file with highest priority in configuration"""
+        assert self.load_only is not None, "Need to be specified a file to be editing"
+
+        try:
+            return self._get_parser_to_modify()[0]
+        except IndexError:
+            return None
+
+    def items(self) -> Iterable[Tuple[str, Any]]:
+        """Returns key-value pairs like dict.items() representing the loaded
+        configuration
+        """
+        return self._dictionary.items()
+
+    def get_value(self, key: str) -> Any:
+        """Get a value from the configuration."""
+        orig_key = key
+        key = _normalize_name(key)
+        try:
+            return self._dictionary[key]
+        except KeyError:
+            # disassembling triggers a more useful error message than simply
+            # "No such key" in the case that the key isn't in the form command.option
+            _disassemble_key(key)
+            raise ConfigurationError(f"No such key - {orig_key}")
+
+    def set_value(self, key: str, value: Any) -> None:
+        """Modify a value in the configuration."""
+        key = _normalize_name(key)
+        self._ensure_have_load_only()
+
+        assert self.load_only
+        fname, parser = self._get_parser_to_modify()
+
+        if parser is not None:
+            section, name = _disassemble_key(key)
+
+            # Modify the parser and the configuration
+            if not parser.has_section(section):
+                parser.add_section(section)
+            parser.set(section, name, value)
+
+        self._config[self.load_only][key] = value
+        self._mark_as_modified(fname, parser)
+
+    def unset_value(self, key: str) -> None:
+        """Unset a value in the configuration."""
+        orig_key = key
+        key = _normalize_name(key)
+        self._ensure_have_load_only()
+
+        assert self.load_only
+        if key not in self._config[self.load_only]:
+            raise ConfigurationError(f"No such key - {orig_key}")
+
+        fname, parser = self._get_parser_to_modify()
+
+        if parser is not None:
+            section, name = _disassemble_key(key)
+            if not (
+                parser.has_section(section) and parser.remove_option(section, name)
+            ):
+                # The option was not removed.
+                raise ConfigurationError(
+                    "Fatal Internal error [id=1]. Please report as a bug."
+                )
+
+            # The section may be empty after the option was removed.
+            if not parser.items(section):
+                parser.remove_section(section)
+            self._mark_as_modified(fname, parser)
+
+        del self._config[self.load_only][key]
+
+    def save(self) -> None:
+        """Save the current in-memory state."""
+        self._ensure_have_load_only()
+
+        for fname, parser in self._modified_parsers:
+            logger.info("Writing to %s", fname)
+
+            # Ensure directory exists.
+            ensure_dir(os.path.dirname(fname))
+
+            # Ensure directory's permission(need to be writeable)
+            try:
+                with open(fname, "w") as f:
+                    parser.write(f)
+            except OSError as error:
+                raise ConfigurationError(
+                    f"An error occurred while writing to the configuration file "
+                    f"{fname}: {error}"
+                )
+
+    #
+    # Private routines
+    #
+
+    def _ensure_have_load_only(self) -> None:
+        if self.load_only is None:
+            raise ConfigurationError("Needed a specific file to be modifying.")
+        logger.debug("Will be working with %s variant only", self.load_only)
+
+    @property
+    def _dictionary(self) -> Dict[str, Any]:
+        """A dictionary representing the loaded configuration."""
+        # NOTE: Dictionaries are not populated if not loaded. So, conditionals
+        #       are not needed here.
+        retval = {}
+
+        for variant in OVERRIDE_ORDER:
+            retval.update(self._config[variant])
+
+        return retval
+
+    def _load_config_files(self) -> None:
+        """Loads configuration from configuration files"""
+        config_files = dict(self.iter_config_files())
+        if config_files[kinds.ENV][0:1] == [os.devnull]:
+            logger.debug(
+                "Skipping loading configuration files due to "
+                "environment's PIP_CONFIG_FILE being os.devnull"
+            )
+            return
+
+        for variant, files in config_files.items():
+            for fname in files:
+                # If there's specific variant set in `load_only`, load only
+                # that variant, not the others.
+                if self.load_only is not None and variant != self.load_only:
+                    logger.debug("Skipping file '%s' (variant: %s)", fname, variant)
+                    continue
+
+                parser = self._load_file(variant, fname)
+
+                # Keeping track of the parsers used
+                self._parsers[variant].append((fname, parser))
+
+    def _load_file(self, variant: Kind, fname: str) -> RawConfigParser:
+        logger.verbose("For variant '%s', will try loading '%s'", variant, fname)
+        parser = self._construct_parser(fname)
+
+        for section in parser.sections():
+            items = parser.items(section)
+            self._config[variant].update(self._normalized_keys(section, items))
+
+        return parser
+
+    def _construct_parser(self, fname: str) -> RawConfigParser:
+        parser = configparser.RawConfigParser()
+        # If there is no such file, don't bother reading it but create the
+        # parser anyway, to hold the data.
+        # Doing this is useful when modifying and saving files, where we don't
+        # need to construct a parser.
+        if os.path.exists(fname):
+            locale_encoding = locale.getpreferredencoding(False)
+            try:
+                parser.read(fname, encoding=locale_encoding)
+            except UnicodeDecodeError:
+                # See https://github.com/pypa/pip/issues/4963
+                raise ConfigurationFileCouldNotBeLoaded(
+                    reason=f"contains invalid {locale_encoding} characters",
+                    fname=fname,
+                )
+            except configparser.Error as error:
+                # See https://github.com/pypa/pip/issues/4893
+                raise ConfigurationFileCouldNotBeLoaded(error=error)
+        return parser
+
+    def _load_environment_vars(self) -> None:
+        """Loads configuration from environment variables"""
+        self._config[kinds.ENV_VAR].update(
+            self._normalized_keys(":env:", self.get_environ_vars())
+        )
+
+    def _normalized_keys(
+        self, section: str, items: Iterable[Tuple[str, Any]]
+    ) -> Dict[str, Any]:
+        """Normalizes items to construct a dictionary with normalized keys.
+
+        This routine is where the names become keys and are made the same
+        regardless of source - configuration files or environment.
+        """
+        normalized = {}
+        for name, val in items:
+            key = section + "." + _normalize_name(name)
+            normalized[key] = val
+        return normalized
+
+    def get_environ_vars(self) -> Iterable[Tuple[str, str]]:
+        """Returns a generator with all environmental vars with prefix PIP_"""
+        for key, val in os.environ.items():
+            if key.startswith("PIP_"):
+                name = key[4:].lower()
+                if name not in ENV_NAMES_IGNORED:
+                    yield name, val
+
+    # XXX: This is patched in the tests.
+    def iter_config_files(self) -> Iterable[Tuple[Kind, List[str]]]:
+        """Yields variant and configuration files associated with it.
+
+        This should be treated like items of a dictionary. The order
+        here doesn't affect what gets overridden. That is controlled
+        by OVERRIDE_ORDER. However this does control the order they are
+        displayed to the user. It's probably most ergonomic to display
+        things in the same order as OVERRIDE_ORDER
+        """
+        # SMELL: Move the conditions out of this function
+
+        env_config_file = os.environ.get("PIP_CONFIG_FILE", None)
+        config_files = get_configuration_files()
+
+        yield kinds.GLOBAL, config_files[kinds.GLOBAL]
+
+        # per-user config is not loaded when env_config_file exists
+        should_load_user_config = not self.isolated and not (
+            env_config_file and os.path.exists(env_config_file)
+        )
+        if should_load_user_config:
+            # The legacy config file is overridden by the new config file
+            yield kinds.USER, config_files[kinds.USER]
+
+        # virtualenv config
+        yield kinds.SITE, config_files[kinds.SITE]
+
+        if env_config_file is not None:
+            yield kinds.ENV, [env_config_file]
+        else:
+            yield kinds.ENV, []
+
+    def get_values_in_config(self, variant: Kind) -> Dict[str, Any]:
+        """Get values present in a config file"""
+        return self._config[variant]
+
+    def _get_parser_to_modify(self) -> Tuple[str, RawConfigParser]:
+        # Determine which parser to modify
+        assert self.load_only
+        parsers = self._parsers[self.load_only]
+        if not parsers:
+            # This should not happen if everything works correctly.
+            raise ConfigurationError(
+                "Fatal Internal error [id=2]. Please report as a bug."
+            )
+
+        # Use the highest priority parser.
+        return parsers[-1]
+
+    # XXX: This is patched in the tests.
+    def _mark_as_modified(self, fname: str, parser: RawConfigParser) -> None:
+        file_parser_tuple = (fname, parser)
+        if file_parser_tuple not in self._modified_parsers:
+            self._modified_parsers.append(file_parser_tuple)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self._dictionary!r})"
+import importlib.util
+import os
+import sys
+from collections import namedtuple
+from typing import Any, List, Optional
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    from pip._vendor import tomli as tomllib
+
+from pip._vendor.packaging.requirements import InvalidRequirement
+
+from pip._internal.exceptions import (
+    InstallationError,
+    InvalidPyProjectBuildRequires,
+    MissingPyProjectBuildRequires,
+)
+from pip._internal.utils.packaging import get_requirement
+
+
+def _is_list_of_str(obj: Any) -> bool:
+    return isinstance(obj, list) and all(isinstance(item, str) for item in obj)
+
+
+def make_pyproject_path(unpacked_source_directory: str) -> str:
+    return os.path.join(unpacked_source_directory, "pyproject.toml")
+
+
+BuildSystemDetails = namedtuple(
+    "BuildSystemDetails", ["requires", "backend", "check", "backend_path"]
+)
+
+
+def load_pyproject_toml(
+    use_pep517: Optional[bool], pyproject_toml: str, setup_py: str, req_name: str
+) -> Optional[BuildSystemDetails]:
+    """Load the pyproject.toml file.
+
+    Parameters:
+        use_pep517 - Has the user requested PEP 517 processing? None
+                     means the user hasn't explicitly specified.
+        pyproject_toml - Location of the project's pyproject.toml file
+        setup_py - Location of the project's setup.py file
+        req_name - The name of the requirement we're processing (for
+                   error reporting)
+
+    Returns:
+        None if we should use the legacy code path, otherwise a tuple
+        (
+            requirements from pyproject.toml,
+            name of PEP 517 backend,
+            requirements we should check are installed after setting
+                up the build environment
+            directory paths to import the backend from (backend-path),
+                relative to the project root.
+        )
+    """
+    has_pyproject = os.path.isfile(pyproject_toml)
+    has_setup = os.path.isfile(setup_py)
+
+    if not has_pyproject and not has_setup:
+        raise InstallationError(
+            f"{req_name} does not appear to be a Python project: "
+            f"neither 'setup.py' nor 'pyproject.toml' found."
+        )
+
+    if has_pyproject:
+        with open(pyproject_toml, encoding="utf-8") as f:
+            pp_toml = tomllib.loads(f.read())
+        build_system = pp_toml.get("build-system")
+    else:
+        build_system = None
+
+    # The following cases must use PEP 517
+    # We check for use_pep517 being non-None and falsy because that means
+    # the user explicitly requested --no-use-pep517.  The value 0 as
+    # opposed to False can occur when the value is provided via an
+    # environment variable or config file option (due to the quirk of
+    # strtobool() returning an integer in pip's configuration code).
+    if has_pyproject and not has_setup:
+        if use_pep517 is not None and not use_pep517:
+            raise InstallationError(
+                "Disabling PEP 517 processing is invalid: "
+                "project does not have a setup.py"
+            )
+        use_pep517 = True
+    elif build_system and "build-backend" in build_system:
+        if use_pep517 is not None and not use_pep517:
+            raise InstallationError(
+                "Disabling PEP 517 processing is invalid: "
+                "project specifies a build backend of {} "
+                "in pyproject.toml".format(build_system["build-backend"])
+            )
+        use_pep517 = True
+
+    # If we haven't worked out whether to use PEP 517 yet,
+    # and the user hasn't explicitly stated a preference,
+    # we do so if the project has a pyproject.toml file
+    # or if we cannot import setuptools or wheels.
+
+    # We fallback to PEP 517 when without setuptools or without the wheel package,
+    # so setuptools can be installed as a default build backend.
+    # For more info see:
+    # https://discuss.python.org/t/pip-without-setuptools-could-the-experience-be-improved/11810/9
+    # https://github.com/pypa/pip/issues/8559
+    elif use_pep517 is None:
+        use_pep517 = (
+            has_pyproject
+            or not importlib.util.find_spec("setuptools")
+            or not importlib.util.find_spec("wheel")
+        )
+
+    # At this point, we know whether we're going to use PEP 517.
+    assert use_pep517 is not None
+
+    # If we're using the legacy code path, there is nothing further
+    # for us to do here.
+    if not use_pep517:
+        return None
+
+    if build_system is None:
+        # Either the user has a pyproject.toml with no build-system
+        # section, or the user has no pyproject.toml, but has opted in
+        # explicitly via --use-pep517.
+        # In the absence of any explicit backend specification, we
+        # assume the setuptools backend that most closely emulates the
+        # traditional direct setup.py execution, and require wheel and
+        # a version of setuptools that supports that backend.
+
+        build_system = {
+            "requires": ["setuptools>=40.8.0"],
+            "build-backend": "setuptools.build_meta:__legacy__",
+        }
+
+    # If we're using PEP 517, we have build system information (either
+    # from pyproject.toml, or defaulted by the code above).
+    # Note that at this point, we do not know if the user has actually
+    # specified a backend, though.
+    assert build_system is not None
+
+    # Ensure that the build-system section in pyproject.toml conforms
+    # to PEP 518.
+
+    # Specifying the build-system table but not the requires key is invalid
+    if "requires" not in build_system:
+        raise MissingPyProjectBuildRequires(package=req_name)
+
+    # Error out if requires is not a list of strings
+    requires = build_system["requires"]
+    if not _is_list_of_str(requires):
+        raise InvalidPyProjectBuildRequires(
+            package=req_name,
+            reason="It is not a list of strings.",
+        )
+
+    # Each requirement must be valid as per PEP 508
+    for requirement in requires:
+        try:
+            get_requirement(requirement)
+        except InvalidRequirement as error:
+            raise InvalidPyProjectBuildRequires(
+                package=req_name,
+                reason=f"It contains an invalid requirement: {requirement!r}",
+            ) from error
+
+    backend = build_system.get("build-backend")
+    backend_path = build_system.get("backend-path", [])
+    check: List[str] = []
+    if backend is None:
+        # If the user didn't specify a backend, we assume they want to use
+        # the setuptools backend. But we can't be sure they have included
+        # a version of setuptools which supplies the backend. So we
+        # make a note to check that this requirement is present once
+        # we have set up the environment.
+        # This is quite a lot of work to check for a very specific case. But
+        # the problem is, that case is potentially quite common - projects that
+        # adopted PEP 518 early for the ability to specify requirements to
+        # execute setup.py, but never considered needing to mention the build
+        # tools themselves. The original PEP 518 code had a similar check (but
+        # implemented in a different way).
+        backend = "setuptools.build_meta:__legacy__"
+        check = ["setuptools>=40.8.0"]
+
+    return BuildSystemDetails(requires, backend, check, backend_path)
+"""Network Authentication Helpers
+
+Contains interface (MultiDomainBasicAuth) and associated glue code for
+providing credentials in the context of network requests.
+"""
+
+import logging
+import os
+import shutil
+import subprocess
+import sysconfig
+import typing
+import urllib.parse
+from abc import ABC, abstractmethod
+from functools import lru_cache
+from os.path import commonprefix
+from pathlib import Path
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+
+from pip._vendor.requests.auth import AuthBase, HTTPBasicAuth
+from pip._vendor.requests.models import Request, Response
+from pip._vendor.requests.utils import get_netrc_auth
+
+from pip._internal.utils.logging import getLogger
+from pip._internal.utils.misc import (
+    ask,
+    ask_input,
+    ask_password,
+    remove_auth_from_url,
+    split_auth_netloc_from_url,
+)
+from pip._internal.vcs.versioncontrol import AuthInfo
+
+logger = getLogger(__name__)
+
+KEYRING_DISABLED = False
+
+
+class Credentials(NamedTuple):
+    url: str
+    username: str
+    password: str
+
+
+class KeyRingBaseProvider(ABC):
+    """Keyring base provider interface"""
+
+    has_keyring: bool
+
+    @abstractmethod
+    def get_auth_info(
+        self, url: str, username: Optional[str]
+    ) -> Optional[AuthInfo]: ...
+
+    @abstractmethod
+    def save_auth_info(self, url: str, username: str, password: str) -> None: ...
+
+
+class KeyRingNullProvider(KeyRingBaseProvider):
+    """Keyring null provider"""
+
+    has_keyring = False
+
+    def get_auth_info(self, url: str, username: Optional[str]) -> Optional[AuthInfo]:
+        return None
+
+    def save_auth_info(self, url: str, username: str, password: str) -> None:
+        return None
+
+
+class KeyRingPythonProvider(KeyRingBaseProvider):
+    """Keyring interface which uses locally imported `keyring`"""
+
+    has_keyring = True
+
+    def __init__(self) -> None:
+        import keyring
+
+        self.keyring = keyring
+
+    def get_auth_info(self, url: str, username: Optional[str]) -> Optional[AuthInfo]:
+        # Support keyring's get_credential interface which supports getting
+        # credentials without a username. This is only available for
+        # keyring>=15.2.0.
+        if hasattr(self.keyring, "get_credential"):
+            logger.debug("Getting credentials from keyring for %s", url)
+            cred = self.keyring.get_credential(url, username)
+            if cred is not None:
+                return cred.username, cred.password
+            return None
+
+        if username is not None:
+            logger.debug("Getting password from keyring for %s", url)
+            password = self.keyring.get_password(url, username)
+            if password:
+                return username, password
+        return None
+
+    def save_auth_info(self, url: str, username: str, password: str) -> None:
+        self.keyring.set_password(url, username, password)
+
+
+class KeyRingCliProvider(KeyRingBaseProvider):
+    """Provider which uses `keyring` cli
+
+    Instead of calling the keyring package installed alongside pip
+    we call keyring on the command line which will enable pip to
+    use which ever installation of keyring is available first in
+    PATH.
+    """
+
+    has_keyring = True
+
+    def __init__(self, cmd: str) -> None:
+        self.keyring = cmd
+
+    def get_auth_info(self, url: str, username: Optional[str]) -> Optional[AuthInfo]:
+        # This is the default implementation of keyring.get_credential
+        # https://github.com/jaraco/keyring/blob/97689324abcf01bd1793d49063e7ca01e03d7d07/keyring/backend.py#L134-L139
+        if username is not None:
+            password = self._get_password(url, username)
+            if password is not None:
+                return username, password
+        return None
+
+    def save_auth_info(self, url: str, username: str, password: str) -> None:
+        return self._set_password(url, username, password)
+
+    def _get_password(self, service_name: str, username: str) -> Optional[str]:
+        """Mirror the implementation of keyring.get_password using cli"""
+        if self.keyring is None:
+            return None
+
+        cmd = [self.keyring, "get", service_name, username]
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        res = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            env=env,
+        )
+        if res.returncode:
+            return None
+        return res.stdout.decode("utf-8").strip(os.linesep)
+
+    def _set_password(self, service_name: str, username: str, password: str) -> None:
+        """Mirror the implementation of keyring.set_password using cli"""
+        if self.keyring is None:
+            return None
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        subprocess.run(
+            [self.keyring, "set", service_name, username],
+            input=f"{password}{os.linesep}".encode(),
+            env=env,
+            check=True,
+        )
+        return None
+
+
+@lru_cache(maxsize=None)
+def get_keyring_provider(provider: str) -> KeyRingBaseProvider:
+    logger.verbose("Keyring provider requested: %s", provider)
+
+    # keyring has previously failed and been disabled
+    if KEYRING_DISABLED:
+        provider = "disabled"
+    if provider in ["import", "auto"]:
+        try:
+            impl = KeyRingPythonProvider()
+            logger.verbose("Keyring provider set: import")
+            return impl
+        except ImportError:
+            pass
+        except Exception as exc:
+            # In the event of an unexpected exception
+            # we should warn the user
+            msg = "Installed copy of keyring fails with exception %s"
+            if provider == "auto":
+                msg = msg + ", trying to find a keyring executable as a fallback"
+            logger.warning(msg, exc, exc_info=logger.isEnabledFor(logging.DEBUG))
+    if provider in ["subprocess", "auto"]:
+        cli = shutil.which("keyring")
+        if cli and cli.startswith(sysconfig.get_path("scripts")):
+            # all code within this function is stolen from shutil.which implementation
+            @typing.no_type_check
+            def PATH_as_shutil_which_determines_it() -> str:
+                path = os.environ.get("PATH", None)
+                if path is None:
+                    try:
+                        path = os.confstr("CS_PATH")
+                    except (AttributeError, ValueError):
+                        # os.confstr() or CS_PATH is not available
+                        path = os.defpath
+                # bpo-35755: Don't use os.defpath if the PATH environment variable is
+                # set to an empty string
+
+                return path
+
+            scripts = Path(sysconfig.get_path("scripts"))
+
+            paths = []
+            for path in PATH_as_shutil_which_determines_it().split(os.pathsep):
+                p = Path(path)
+                try:
+                    if not p.samefile(scripts):
+                        paths.append(path)
+                except FileNotFoundError:
+                    pass
+
+            path = os.pathsep.join(paths)
+
+            cli = shutil.which("keyring", path=path)
+
+        if cli:
+            logger.verbose("Keyring provider set: subprocess with executable %s", cli)
+            return KeyRingCliProvider(cli)
+
+    logger.verbose("Keyring provider set: disabled")
+    return KeyRingNullProvider()
+
+
+class MultiDomainBasicAuth(AuthBase):
+    def __init__(
+        self,
+        prompting: bool = True,
+        index_urls: Optional[List[str]] = None,
+        keyring_provider: str = "auto",
+    ) -> None:
+        self.prompting = prompting
+        self.index_urls = index_urls
+        self.keyring_provider = keyring_provider  # type: ignore[assignment]
+        self.passwords: Dict[str, AuthInfo] = {}
+        # When the user is prompted to enter credentials and keyring is
+        # available, we will offer to save them. If the user accepts,
+        # this value is set to the credentials they entered. After the
+        # request authenticates, the caller should call
+        # ``save_credentials`` to save these.
+        self._credentials_to_save: Optional[Credentials] = None
+
+    @property
+    def keyring_provider(self) -> KeyRingBaseProvider:
+        return get_keyring_provider(self._keyring_provider)
+
+    @keyring_provider.setter
+    def keyring_provider(self, provider: str) -> None:
+        # The free function get_keyring_provider has been decorated with
+        # functools.cache. If an exception occurs in get_keyring_auth that
+        # cache will be cleared and keyring disabled, take that into account
+        # if you want to remove this indirection.
+        self._keyring_provider = provider
+
+    @property
+    def use_keyring(self) -> bool:
+        # We won't use keyring when --no-input is passed unless
+        # a specific provider is requested because it might require
+        # user interaction
+        return self.prompting or self._keyring_provider not in ["auto", "disabled"]
+
+    def _get_keyring_auth(
+        self,
+        url: Optional[str],
+        username: Optional[str],
+    ) -> Optional[AuthInfo]:
+        """Return the tuple auth for a given url from keyring."""
+        # Do nothing if no url was provided
+        if not url:
+            return None
+
+        try:
+            return self.keyring_provider.get_auth_info(url, username)
+        except Exception as exc:
+            # Log the full exception (with stacktrace) at debug, so it'll only
+            # show up when running in verbose mode.
+            logger.debug("Keyring is skipped due to an exception", exc_info=True)
+            # Always log a shortened version of the exception.
+            logger.warning(
+                "Keyring is skipped due to an exception: %s",
+                str(exc),
+            )
+            global KEYRING_DISABLED
+            KEYRING_DISABLED = True
+            get_keyring_provider.cache_clear()
+            return None
+
+    def _get_index_url(self, url: str) -> Optional[str]:
+        """Return the original index URL matching the requested URL.
+
+        Cached or dynamically generated credentials may work against
+        the original index URL rather than just the netloc.
+
+        The provided url should have had its username and password
+        removed already. If the original index url had credentials then
+        they will be included in the return value.
+
+        Returns None if no matching index was found, or if --no-index
+        was specified by the user.
+        """
+        if not url or not self.index_urls:
+            return None
+
+        url = remove_auth_from_url(url).rstrip("/") + "/"
+        parsed_url = urllib.parse.urlsplit(url)
+
+        candidates = []
+
+        for index in self.index_urls:
+            index = index.rstrip("/") + "/"
+            parsed_index = urllib.parse.urlsplit(remove_auth_from_url(index))
+            if parsed_url == parsed_index:
+                return index
+
+            if parsed_url.netloc != parsed_index.netloc:
+                continue
+
+            candidate = urllib.parse.urlsplit(index)
+            candidates.append(candidate)
+
+        if not candidates:
+            return None
+
+        candidates.sort(
+            reverse=True,
+            key=lambda candidate: commonprefix(
+                [
+                    parsed_url.path,
+                    candidate.path,
+                ]
+            ).rfind("/"),
+        )
+
+        return urllib.parse.urlunsplit(candidates[0])
+
+    def _get_new_credentials(
+        self,
+        original_url: str,
+        *,
+        allow_netrc: bool = True,
+        allow_keyring: bool = False,
+    ) -> AuthInfo:
+        """Find and return credentials for the specified URL."""
+        # Split the credentials and netloc from the url.
+        url, netloc, url_user_password = split_auth_netloc_from_url(
+            original_url,
+        )
+
+        # Start with the credentials embedded in the url
+        username, password = url_user_password
+        if username is not None and password is not None:
+            logger.debug("Found credentials in url for %s", netloc)
+            return url_user_password
+
+        # Find a matching index url for this request
+        index_url = self._get_index_url(url)
+        if index_url:
+            # Split the credentials from the url.
+            index_info = split_auth_netloc_from_url(index_url)
+            if index_info:
+                index_url, _, index_url_user_password = index_info
+                logger.debug("Found index url %s", index_url)
+
+        # If an index URL was found, try its embedded credentials
+        if index_url and index_url_user_password[0] is not None:
+            username, password = index_url_user_password
+            if username is not None and password is not None:
+                logger.debug("Found credentials in index url for %s", netloc)
+                return index_url_user_password
+
+        # Get creds from netrc if we still don't have them
+        if allow_netrc:
+            netrc_auth = get_netrc_auth(original_url)
+            if netrc_auth:
+                logger.debug("Found credentials in netrc for %s", netloc)
+                return netrc_auth
+
+        # If we don't have a password and keyring is available, use it.
+        if allow_keyring:
+            # The index url is more specific than the netloc, so try it first
+            # fmt: off
+            kr_auth = (
+                self._get_keyring_auth(index_url, username) or
+                self._get_keyring_auth(netloc, username)
+            )
+            # fmt: on
+            if kr_auth:
+                logger.debug("Found credentials in keyring for %s", netloc)
+                return kr_auth
+
+        return username, password
+
+    def _get_url_and_credentials(
+        self, original_url: str
+    ) -> Tuple[str, Optional[str], Optional[str]]:
+        """Return the credentials to use for the provided URL.
+
+        If allowed, netrc and keyring may be used to obtain the
+        correct credentials.
+
+        Returns (url_without_credentials, username, password). Note
+        that even if the original URL contains credentials, this
+        function may return a different username and password.
+        """
+        url, netloc, _ = split_auth_netloc_from_url(original_url)
+
+        # Try to get credentials from original url
+        username, password = self._get_new_credentials(original_url)
+
+        # If credentials not found, use any stored credentials for this netloc.
+        # Do this if either the username or the password is missing.
+        # This accounts for the situation in which the user has specified
+        # the username in the index url, but the password comes from keyring.
+        if (username is None or password is None) and netloc in self.passwords:
+            un, pw = self.passwords[netloc]
+            # It is possible that the cached credentials are for a different username,
+            # in which case the cache should be ignored.
+            if username is None or username == un:
+                username, password = un, pw
+
+        if username is not None or password is not None:
+            # Convert the username and password if they're None, so that
+            # this netloc will show up as "cached" in the conditional above.
+            # Further, HTTPBasicAuth doesn't accept None, so it makes sense to
+            # cache the value that is going to be used.
+            username = username or ""
+            password = password or ""
+
+            # Store any acquired credentials.
+            self.passwords[netloc] = (username, password)
+
+        assert (
+            # Credentials were found
+            (username is not None and password is not None)
+            # Credentials were not found
+            or (username is None and password is None)
+        ), f"Could not load credentials from url: {original_url}"
+
+        return url, username, password
+
+    def __call__(self, req: Request) -> Request:
+        # Get credentials for this request
+        url, username, password = self._get_url_and_credentials(req.url)
+
+        # Set the url of the request to the url without any credentials
+        req.url = url
+
+        if username is not None and password is not None:
+            # Send the basic auth with this request
+            req = HTTPBasicAuth(username, password)(req)
+
+        # Attach a hook to handle 401 responses
+        req.register_hook("response", self.handle_401)
+
+        return req
+
+    # Factored out to allow for easy patching in tests
+    def _prompt_for_password(
+        self, netloc: str
+    ) -> Tuple[Optional[str], Optional[str], bool]:
+        username = ask_input(f"User for {netloc}: ") if self.prompting else None
+        if not username:
+            return None, None, False
+        if self.use_keyring:
+            auth = self._get_keyring_auth(netloc, username)
+            if auth and auth[0] is not None and auth[1] is not None:
+                return auth[0], auth[1], False
+        password = ask_password("Password: ")
+        return username, password, True
+
+    # Factored out to allow for easy patching in tests
+    def _should_save_password_to_keyring(self) -> bool:
+        if (
+            not self.prompting
+            or not self.use_keyring
+            or not self.keyring_provider.has_keyring
+        ):
+            return False
+        return ask("Save credentials to keyring [y/N]: ", ["y", "n"]) == "y"
+
+    def handle_401(self, resp: Response, **kwargs: Any) -> Response:
+        # We only care about 401 responses, anything else we want to just
+        #   pass through the actual response
+        if resp.status_code != 401:
+            return resp
+
+        username, password = None, None
+
+        # Query the keyring for credentials:
+        if self.use_keyring:
+            username, password = self._get_new_credentials(
+                resp.url,
+                allow_netrc=False,
+                allow_keyring=True,
+            )
+
+        # We are not able to prompt the user so simply return the response
+        if not self.prompting and not username and not password:
+            return resp
+
+        parsed = urllib.parse.urlparse(resp.url)
+
+        # Prompt the user for a new username and password
+        save = False
+        if not username and not password:
+            username, password, save = self._prompt_for_password(parsed.netloc)
+
+        # Store the new username and password to use for future requests
+        self._credentials_to_save = None
+        if username is not None and password is not None:
+            self.passwords[parsed.netloc] = (username, password)
+
+            # Prompt to save the password to keyring
+            if save and self._should_save_password_to_keyring():
+                self._credentials_to_save = Credentials(
+                    url=parsed.netloc,
+                    username=username,
+                    password=password,
+                )
+
+        # Consume content and release the original connection to allow our new
+        #   request to reuse the same one.
+        # The result of the assignment isn't used, it's just needed to consume
+        # the content.
+        _ = resp.content
+        resp.raw.release_conn()
+
+        # Add our new username and password to the request
+        req = HTTPBasicAuth(username or "", password or "")(resp.request)
+        req.register_hook("response", self.warn_on_401)
+
+        # On successful request, save the credentials that were used to
+        # keyring. (Note that if the user responded "no" above, this member
+        # is not set and nothing will be saved.)
+        if self._credentials_to_save:
+            req.register_hook("response", self.save_credentials)
+
+        # Send our new request
+        new_resp = resp.connection.send(req, **kwargs)
+        new_resp.history.append(resp)
+
+        return new_resp
+
+    def warn_on_401(self, resp: Response, **kwargs: Any) -> None:
+        """Response callback to warn about incorrect credentials."""
+        if resp.status_code == 401:
+            logger.warning(
+                "401 Error, Credentials not correct for %s",
+                resp.request.url,
+            )
+
+    def save_credentials(self, resp: Response, **kwargs: Any) -> None:
+        """Response callback to save credentials on success."""
+        assert (
+            self.keyring_provider.has_keyring
+        ), "should never reach here without keyring"
+
+        creds = self._credentials_to_save
+        self._credentials_to_save = None
+        if creds and resp.status_code < 400:
+            try:
+                logger.info("Saving credentials to keyring")
+                self.keyring_provider.save_auth_info(
+                    creds.url, creds.username, creds.password
+                )
+            except Exception:
+                logger.exception("Failed to save credentials")
+"""xmlrpclib.Transport implementation"""
+
+import logging
+import urllib.parse
+import xmlrpc.client
+from typing import TYPE_CHECKING, Tuple
+
+from pip._internal.exceptions import NetworkConnectionError
+from pip._internal.network.session import PipSession
+from pip._internal.network.utils import raise_for_status
+
+if TYPE_CHECKING:
+    from xmlrpc.client import _HostType, _Marshallable
+
+    from _typeshed import SizedBuffer
+
+logger = logging.getLogger(__name__)
+
+
+class PipXmlrpcTransport(xmlrpc.client.Transport):
+    """Provide a `xmlrpclib.Transport` implementation via a `PipSession`
+    object.
+    """
+
+    def __init__(
+        self, index_url: str, session: PipSession, use_datetime: bool = False
+    ) -> None:
+        super().__init__(use_datetime)
+        index_parts = urllib.parse.urlparse(index_url)
+        self._scheme = index_parts.scheme
+        self._session = session
+
+    def request(
+        self,
+        host: "_HostType",
+        handler: str,
+        request_body: "SizedBuffer",
+        verbose: bool = False,
+    ) -> Tuple["_Marshallable", ...]:
+        assert isinstance(host, str)
+        parts = (self._scheme, host, handler, None, None, None)
+        url = urllib.parse.urlunparse(parts)
+        try:
+            headers = {"Content-Type": "text/xml"}
+            response = self._session.post(
+                url,
+                data=request_body,
+                headers=headers,
+                stream=True,
+            )
+            raise_for_status(response)
+            self.verbose = verbose
+            return self.parse_response(response.raw)
+        except NetworkConnectionError as exc:
+            assert exc.response
+            logger.critical(
+                "HTTP error %s while getting %s",
+                exc.response.status_code,
+                url,
+            )
+            raise
+"""Download files with progress indicators."""
+
+import email.message
+import logging
+import mimetypes
+import os
+from http import HTTPStatus
+from typing import BinaryIO, Iterable, Optional, Tuple
+
+from pip._vendor.requests.models import Response
+from pip._vendor.urllib3.exceptions import ReadTimeoutError
+
+from pip._internal.cli.progress_bars import get_download_progress_renderer
+from pip._internal.exceptions import IncompleteDownloadError, NetworkConnectionError
+from pip._internal.models.index import PyPI
+from pip._internal.models.link import Link
+from pip._internal.network.cache import is_from_cache
+from pip._internal.network.session import PipSession
+from pip._internal.network.utils import HEADERS, raise_for_status, response_chunks
+from pip._internal.utils.misc import format_size, redact_auth_from_url, splitext
+
+logger = logging.getLogger(__name__)
+
+
+def _get_http_response_size(resp: Response) -> Optional[int]:
+    try:
+        return int(resp.headers["content-length"])
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def _get_http_response_etag_or_last_modified(resp: Response) -> Optional[str]:
+    """
+    Return either the ETag or Last-Modified header (or None if neither exists).
+    The return value can be used in an If-Range header.
+    """
+    return resp.headers.get("etag", resp.headers.get("last-modified"))
+
+
+def _prepare_download(
+    resp: Response,
+    link: Link,
+    progress_bar: str,
+    total_length: Optional[int],
+    range_start: Optional[int] = 0,
+) -> Iterable[bytes]:
+    if link.netloc == PyPI.file_storage_domain:
+        url = link.show_url
+    else:
+        url = link.url_without_fragment
+
+    logged_url = redact_auth_from_url(url)
+
+    if total_length:
+        if range_start:
+            logged_url = (
+                f"{logged_url} ({format_size(range_start)}/{format_size(total_length)})"
+            )
+        else:
+            logged_url = f"{logged_url} ({format_size(total_length)})"
+
+    if is_from_cache(resp):
+        logger.info("Using cached %s", logged_url)
+    elif range_start:
+        logger.info("Resuming download %s", logged_url)
+    else:
+        logger.info("Downloading %s", logged_url)
+
+    if logger.getEffectiveLevel() > logging.INFO:
+        show_progress = False
+    elif is_from_cache(resp):
+        show_progress = False
+    elif not total_length:
+        show_progress = True
+    elif total_length > (512 * 1024):
+        show_progress = True
+    else:
+        show_progress = False
+
+    chunks = response_chunks(resp)
+
+    if not show_progress:
+        return chunks
+
+    renderer = get_download_progress_renderer(
+        bar_type=progress_bar, size=total_length, initial_progress=range_start
+    )
+    return renderer(chunks)
+
+
+def sanitize_content_filename(filename: str) -> str:
+    """
+    Sanitize the "filename" value from a Content-Disposition header.
+    """
+    return os.path.basename(filename)
+
+
+def parse_content_disposition(content_disposition: str, default_filename: str) -> str:
+    """
+    Parse the "filename" value from a Content-Disposition header, and
+    return the default filename if the result is empty.
+    """
+    m = email.message.Message()
+    m["content-type"] = content_disposition
+    filename = m.get_param("filename")
+    if filename:
+        # We need to sanitize the filename to prevent directory traversal
+        # in case the filename contains ".." path parts.
+        filename = sanitize_content_filename(str(filename))
+    return filename or default_filename
+
+
+def _get_http_response_filename(resp: Response, link: Link) -> str:
+    """Get an ideal filename from the given HTTP response, falling back to
+    the link filename if not provided.
+    """
+    filename = link.filename  # fallback
+    # Have a look at the Content-Disposition header for a better guess
+    content_disposition = resp.headers.get("content-disposition")
+    if content_disposition:
+        filename = parse_content_disposition(content_disposition, filename)
+    ext: Optional[str] = splitext(filename)[1]
+    if not ext:
+        ext = mimetypes.guess_extension(resp.headers.get("content-type", ""))
+        if ext:
+            filename += ext
+    if not ext and link.url != resp.url:
+        ext = os.path.splitext(resp.url)[1]
+        if ext:
+            filename += ext
+    return filename
+
+
+def _http_get_download(
+    session: PipSession,
+    link: Link,
+    range_start: Optional[int] = 0,
+    if_range: Optional[str] = None,
+) -> Response:
+    target_url = link.url.split("#", 1)[0]
+    headers = HEADERS.copy()
+    # request a partial download
+    if range_start:
+        headers["Range"] = f"bytes={range_start}-"
+    # make sure the file hasn't changed
+    if if_range:
+        headers["If-Range"] = if_range
+    try:
+        resp = session.get(target_url, headers=headers, stream=True)
+        raise_for_status(resp)
+    except NetworkConnectionError as e:
+        assert e.response is not None
+        logger.critical("HTTP error %s while getting %s", e.response.status_code, link)
+        raise
+    return resp
+
+
+class Downloader:
+    def __init__(
+        self,
+        session: PipSession,
+        progress_bar: str,
+        resume_retries: int,
+    ) -> None:
+        assert (
+            resume_retries >= 0
+        ), "Number of max resume retries must be bigger or equal to zero"
+        self._session = session
+        self._progress_bar = progress_bar
+        self._resume_retries = resume_retries
+
+    def __call__(self, link: Link, location: str) -> Tuple[str, str]:
+        """Download the file given by link into location."""
+        resp = _http_get_download(self._session, link)
+        # NOTE: The original download size needs to be passed down everywhere
+        # so if the download is resumed (with a HTTP Range request) the progress
+        # bar will report the right size.
+        total_length = _get_http_response_size(resp)
+        content_type = resp.headers.get("Content-Type", "")
+
+        filename = _get_http_response_filename(resp, link)
+        filepath = os.path.join(location, filename)
+
+        with open(filepath, "wb") as content_file:
+            bytes_received = self._process_response(
+                resp, link, content_file, 0, total_length
+            )
+            # If possible, check for an incomplete download and attempt resuming.
+            if total_length and bytes_received < total_length:
+                self._attempt_resume(
+                    resp, link, content_file, total_length, bytes_received
+                )
+
+        return filepath, content_type
+
+    def _process_response(
+        self,
+        resp: Response,
+        link: Link,
+        content_file: BinaryIO,
+        bytes_received: int,
+        total_length: Optional[int],
+    ) -> int:
+        """Process the response and write the chunks to the file."""
+        chunks = _prepare_download(
+            resp, link, self._progress_bar, total_length, range_start=bytes_received
+        )
+        return self._write_chunks_to_file(
+            chunks, content_file, allow_partial=bool(total_length)
+        )
+
+    def _write_chunks_to_file(
+        self, chunks: Iterable[bytes], content_file: BinaryIO, *, allow_partial: bool
+    ) -> int:
+        """Write the chunks to the file and return the number of bytes received."""
+        bytes_received = 0
+        try:
+            for chunk in chunks:
+                bytes_received += len(chunk)
+                content_file.write(chunk)
+        except ReadTimeoutError as e:
+            # If partial downloads are OK (the download will be retried), don't bail.
+            if not allow_partial:
+                raise e
+
+            # Ensuring bytes_received is returned to attempt resume
+            logger.warning("Connection timed out while downloading.")
+
+        return bytes_received
+
+    def _attempt_resume(
+        self,
+        resp: Response,
+        link: Link,
+        content_file: BinaryIO,
+        total_length: Optional[int],
+        bytes_received: int,
+    ) -> None:
+        """Attempt to resume the download if connection was dropped."""
+        etag_or_last_modified = _get_http_response_etag_or_last_modified(resp)
+
+        attempts_left = self._resume_retries
+        while total_length and attempts_left and bytes_received < total_length:
+            attempts_left -= 1
+
+            logger.warning(
+                "Attempting to resume incomplete download (%s/%s, attempt %d)",
+                format_size(bytes_received),
+                format_size(total_length),
+                (self._resume_retries - attempts_left),
+            )
+
+            try:
+                # Try to resume the download using a HTTP range request.
+                resume_resp = _http_get_download(
+                    self._session,
+                    link,
+                    range_start=bytes_received,
+                    if_range=etag_or_last_modified,
+                )
+
+                # Fallback: if the server responded with 200 (i.e., the file has
+                # since been modified or range requests are unsupported) or any
+                # other unexpected status, restart the download from the beginning.
+                must_restart = resume_resp.status_code != HTTPStatus.PARTIAL_CONTENT
+                if must_restart:
+                    bytes_received, total_length, etag_or_last_modified = (
+                        self._reset_download_state(resume_resp, content_file)
+                    )
+
+                bytes_received += self._process_response(
+                    resume_resp, link, content_file, bytes_received, total_length
+                )
+            except (ConnectionError, ReadTimeoutError, OSError):
+                continue
+
+        # No more resume attempts. Raise an error if the download is still incomplete.
+        if total_length and bytes_received < total_length:
+            os.remove(content_file.name)
+            raise IncompleteDownloadError(
+                link, bytes_received, total_length, retries=self._resume_retries
+            )
+
+    def _reset_download_state(
+        self,
+        resp: Response,
+        content_file: BinaryIO,
+    ) -> Tuple[int, Optional[int], Optional[str]]:
+        """Reset the download state to restart downloading from the beginning."""
+        content_file.seek(0)
+        content_file.truncate()
+        bytes_received = 0
+        total_length = _get_http_response_size(resp)
+        etag_or_last_modified = _get_http_response_etag_or_last_modified(resp)
+
+        return bytes_received, total_length, etag_or_last_modified
+
+
+class BatchDownloader:
+    def __init__(
+        self,
+        session: PipSession,
+        progress_bar: str,
+        resume_retries: int,
+    ) -> None:
+        self._downloader = Downloader(session, progress_bar, resume_retries)
+
+    def __call__(
+        self, links: Iterable[Link], location: str
+    ) -> Iterable[Tuple[Link, Tuple[str, str]]]:
+        """Download the files given by links into location."""
+        for link in links:
+            filepath, content_type = self._downloader(link, location)
+            yield link, (filepath, content_type)
+"""PipSession and supporting code, containing all pip-specific
+network request configuration and behavior.
+"""
+
+import email.utils
+import functools
+import io
+import ipaddress
+import json
+import logging
+import mimetypes
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import urllib.parse
+import warnings
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Generator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
+
+from pip._vendor import requests, urllib3
+from pip._vendor.cachecontrol import CacheControlAdapter as _BaseCacheControlAdapter
+from pip._vendor.requests.adapters import DEFAULT_POOLBLOCK, BaseAdapter
+from pip._vendor.requests.adapters import HTTPAdapter as _BaseHTTPAdapter
+from pip._vendor.requests.models import PreparedRequest, Response
+from pip._vendor.requests.structures import CaseInsensitiveDict
+from pip._vendor.urllib3.connectionpool import ConnectionPool
+from pip._vendor.urllib3.exceptions import InsecureRequestWarning
+
+from pip import __version__
+from pip._internal.metadata import get_default_environment
+from pip._internal.models.link import Link
+from pip._internal.network.auth import MultiDomainBasicAuth
+from pip._internal.network.cache import SafeFileCache
+
+# Import ssl from compat so the initial import occurs in only one place.
+from pip._internal.utils.compat import has_tls
+from pip._internal.utils.glibc import libc_ver
+from pip._internal.utils.misc import build_url_from_netloc, parse_netloc
+from pip._internal.utils.urls import url_to_path
+
+if TYPE_CHECKING:
+    from ssl import SSLContext
+
+    from pip._vendor.urllib3.poolmanager import PoolManager
+
+
+logger = logging.getLogger(__name__)
+
+SecureOrigin = Tuple[str, str, Optional[Union[int, str]]]
+
+
+# Ignore warning raised when using --trusted-host.
+warnings.filterwarnings("ignore", category=InsecureRequestWarning)
+
+
+SECURE_ORIGINS: List[SecureOrigin] = [
+    # protocol, hostname, port
+    # Taken from Chrome's list of secure origins (See: http://bit.ly/1qrySKC)
+    ("https", "*", "*"),
+    ("*", "localhost", "*"),
+    ("*", "127.0.0.0/8", "*"),
+    ("*", "::1/128", "*"),
+    ("file", "*", None),
+    # ssh is always secure.
+    ("ssh", "*", "*"),
+]
+
+
+# These are environment variables present when running under various
+# CI systems.  For each variable, some CI systems that use the variable
+# are indicated.  The collection was chosen so that for each of a number
+# of popular systems, at least one of the environment variables is used.
+# This list is used to provide some indication of and lower bound for
+# CI traffic to PyPI.  Thus, it is okay if the list is not comprehensive.
+# For more background, see: https://github.com/pypa/pip/issues/5499
+CI_ENVIRONMENT_VARIABLES = (
+    # Azure Pipelines
+    "BUILD_BUILDID",
+    # Jenkins
+    "BUILD_ID",
+    # AppVeyor, CircleCI, Codeship, Gitlab CI, Shippable, Travis CI
+    "CI",
+    # Explicit environment variable.
+    "PIP_IS_CI",
+)
+
+
+def looks_like_ci() -> bool:
+    """
+    Return whether it looks like pip is running under CI.
+    """
+    # We don't use the method of checking for a tty (e.g. using isatty())
+    # because some CI systems mimic a tty (e.g. Travis CI).  Thus that
+    # method doesn't provide definitive information in either direction.
+    return any(name in os.environ for name in CI_ENVIRONMENT_VARIABLES)
+
+
+@functools.lru_cache(maxsize=1)
+def user_agent() -> str:
+    """
+    Return a string representing the user agent.
+    """
+    data: Dict[str, Any] = {
+        "installer": {"name": "pip", "version": __version__},
+        "python": platform.python_version(),
+        "implementation": {
+            "name": platform.python_implementation(),
+        },
+    }
+
+    if data["implementation"]["name"] == "CPython":
+        data["implementation"]["version"] = platform.python_version()
+    elif data["implementation"]["name"] == "PyPy":
+        pypy_version_info = sys.pypy_version_info  # type: ignore
+        if pypy_version_info.releaselevel == "final":
+            pypy_version_info = pypy_version_info[:3]
+        data["implementation"]["version"] = ".".join(
+            [str(x) for x in pypy_version_info]
+        )
+    elif data["implementation"]["name"] == "Jython":
+        # Complete Guess
+        data["implementation"]["version"] = platform.python_version()
+    elif data["implementation"]["name"] == "IronPython":
+        # Complete Guess
+        data["implementation"]["version"] = platform.python_version()
+
+    if sys.platform.startswith("linux"):
+        from pip._vendor import distro
+
+        linux_distribution = distro.name(), distro.version(), distro.codename()
+        distro_infos: Dict[str, Any] = dict(
+            filter(
+                lambda x: x[1],
+                zip(["name", "version", "id"], linux_distribution),
+            )
+        )
+        libc = dict(
+            filter(
+                lambda x: x[1],
+                zip(["lib", "version"], libc_ver()),
+            )
+        )
+        if libc:
+            distro_infos["libc"] = libc
+        if distro_infos:
+            data["distro"] = distro_infos
+
+    if sys.platform.startswith("darwin") and platform.mac_ver()[0]:
+        data["distro"] = {"name": "macOS", "version": platform.mac_ver()[0]}
+
+    if platform.system():
+        data.setdefault("system", {})["name"] = platform.system()
+
+    if platform.release():
+        data.setdefault("system", {})["release"] = platform.release()
+
+    if platform.machine():
+        data["cpu"] = platform.machine()
+
+    if has_tls():
+        import _ssl as ssl
+
+        data["openssl_version"] = ssl.OPENSSL_VERSION
+
+    setuptools_dist = get_default_environment().get_distribution("setuptools")
+    if setuptools_dist is not None:
+        data["setuptools_version"] = str(setuptools_dist.version)
+
+    if shutil.which("rustc") is not None:
+        # If for any reason `rustc --version` fails, silently ignore it
+        try:
+            rustc_output = subprocess.check_output(
+                ["rustc", "--version"], stderr=subprocess.STDOUT, timeout=0.5
+            )
+        except Exception:
+            pass
+        else:
+            if rustc_output.startswith(b"rustc "):
+                # The format of `rustc --version` is:
+                # `b'rustc 1.52.1 (9bc8c42bb 2021-05-09)\n'`
+                # We extract just the middle (1.52.1) part
+                data["rustc_version"] = rustc_output.split(b" ")[1].decode()
+
+    # Use None rather than False so as not to give the impression that
+    # pip knows it is not being run under CI.  Rather, it is a null or
+    # inconclusive result.  Also, we include some value rather than no
+    # value to make it easier to know that the check has been run.
+    data["ci"] = True if looks_like_ci() else None
+
+    user_data = os.environ.get("PIP_USER_AGENT_USER_DATA")
+    if user_data is not None:
+        data["user_data"] = user_data
+
+    return "{data[installer][name]}/{data[installer][version]} {json}".format(
+        data=data,
+        json=json.dumps(data, separators=(",", ":"), sort_keys=True),
+    )
+
+
+class LocalFSAdapter(BaseAdapter):
+    def send(
+        self,
+        request: PreparedRequest,
+        stream: bool = False,
+        timeout: Optional[Union[float, Tuple[float, float]]] = None,
+        verify: Union[bool, str] = True,
+        cert: Optional[Union[str, Tuple[str, str]]] = None,
+        proxies: Optional[Mapping[str, str]] = None,
+    ) -> Response:
+        pathname = url_to_path(request.url)
+
+        resp = Response()
+        resp.status_code = 200
+        resp.url = request.url
+
+        try:
+            stats = os.stat(pathname)
+        except OSError as exc:
+            # format the exception raised as a io.BytesIO object,
+            # to return a better error message:
+            resp.status_code = 404
+            resp.reason = type(exc).__name__
+            resp.raw = io.BytesIO(f"{resp.reason}: {exc}".encode())
+        else:
+            modified = email.utils.formatdate(stats.st_mtime, usegmt=True)
+            content_type = mimetypes.guess_type(pathname)[0] or "text/plain"
+            resp.headers = CaseInsensitiveDict(
+                {
+                    "Content-Type": content_type,
+                    "Content-Length": stats.st_size,
+                    "Last-Modified": modified,
+                }
+            )
+
+            resp.raw = open(pathname, "rb")
+            resp.close = resp.raw.close
+
+        return resp
+
+    def close(self) -> None:
+        pass
+
+
+class _SSLContextAdapterMixin:
+    """Mixin to add the ``ssl_context`` constructor argument to HTTP adapters.
+
+    The additional argument is forwarded directly to the pool manager. This allows us
+    to dynamically decide what SSL store to use at runtime, which is used to implement
+    the optional ``truststore`` backend.
+    """
+
+    def __init__(
+        self,
+        *,
+        ssl_context: Optional["SSLContext"] = None,
+        **kwargs: Any,
+    ) -> None:
+        self._ssl_context = ssl_context
+        super().__init__(**kwargs)
+
+    def init_poolmanager(
+        self,
+        connections: int,
+        maxsize: int,
+        block: bool = DEFAULT_POOLBLOCK,
+        **pool_kwargs: Any,
+    ) -> "PoolManager":
+        if self._ssl_context is not None:
+            pool_kwargs.setdefault("ssl_context", self._ssl_context)
+        return super().init_poolmanager(  # type: ignore[misc]
+            connections=connections,
+            maxsize=maxsize,
+            block=block,
+            **pool_kwargs,
+        )
+
+
+class HTTPAdapter(_SSLContextAdapterMixin, _BaseHTTPAdapter):
+    pass
+
+
+class CacheControlAdapter(_SSLContextAdapterMixin, _BaseCacheControlAdapter):
+    pass
+
+
+class InsecureHTTPAdapter(HTTPAdapter):
+    def cert_verify(
+        self,
+        conn: ConnectionPool,
+        url: str,
+        verify: Union[bool, str],
+        cert: Optional[Union[str, Tuple[str, str]]],
+    ) -> None:
+        super().cert_verify(conn=conn, url=url, verify=False, cert=cert)
+
+
+class InsecureCacheControlAdapter(CacheControlAdapter):
+    def cert_verify(
+        self,
+        conn: ConnectionPool,
+        url: str,
+        verify: Union[bool, str],
+        cert: Optional[Union[str, Tuple[str, str]]],
+    ) -> None:
+        super().cert_verify(conn=conn, url=url, verify=False, cert=cert)
+
+
+class PipSession(requests.Session):
+    timeout: Optional[int] = None
+
+    def __init__(
+        self,
+        *args: Any,
+        retries: int = 0,
+        cache: Optional[str] = None,
+        trusted_hosts: Sequence[str] = (),
+        index_urls: Optional[List[str]] = None,
+        ssl_context: Optional["SSLContext"] = None,
+        **kwargs: Any,
+    ) -> None:
+        """
+        :param trusted_hosts: Domains not to emit warnings for when not using
+            HTTPS.
+        """
+        super().__init__(*args, **kwargs)
+
+        # Namespace the attribute with "pip_" just in case to prevent
+        # possible conflicts with the base class.
+        self.pip_trusted_origins: List[Tuple[str, Optional[int]]] = []
+        self.pip_proxy = None
+
+        # Attach our User Agent to the request
+        self.headers["User-Agent"] = user_agent()
+
+        # Attach our Authentication handler to the session
+        self.auth = MultiDomainBasicAuth(index_urls=index_urls)
+
+        # Create our urllib3.Retry instance which will allow us to customize
+        # how we handle retries.
+        retries = urllib3.Retry(
+            # Set the total number of retries that a particular request can
+            # have.
+            total=retries,
+            # A 503 error from PyPI typically means that the Fastly -> Origin
+            # connection got interrupted in some way. A 503 error in general
+            # is typically considered a transient error so we'll go ahead and
+            # retry it.
+            # A 500 may indicate transient error in Amazon S3
+            # A 502 may be a transient error from a CDN like CloudFlare or CloudFront
+            # A 520 or 527 - may indicate transient error in CloudFlare
+            status_forcelist=[500, 502, 503, 520, 527],
+            # Add a small amount of back off between failed requests in
+            # order to prevent hammering the service.
+            backoff_factor=0.25,
+        )  # type: ignore
+
+        # Our Insecure HTTPAdapter disables HTTPS validation. It does not
+        # support caching so we'll use it for all http:// URLs.
+        # If caching is disabled, we will also use it for
+        # https:// hosts that we've marked as ignoring
+        # TLS errors for (trusted-hosts).
+        insecure_adapter = InsecureHTTPAdapter(max_retries=retries)
+
+        # We want to _only_ cache responses on securely fetched origins or when
+        # the host is specified as trusted. We do this because
+        # we can't validate the response of an insecurely/untrusted fetched
+        # origin, and we don't want someone to be able to poison the cache and
+        # require manual eviction from the cache to fix it.
+        if cache:
+            secure_adapter = CacheControlAdapter(
+                cache=SafeFileCache(cache),
+                max_retries=retries,
+                ssl_context=ssl_context,
+            )
+            self._trusted_host_adapter = InsecureCacheControlAdapter(
+                cache=SafeFileCache(cache),
+                max_retries=retries,
+            )
+        else:
+            secure_adapter = HTTPAdapter(max_retries=retries, ssl_context=ssl_context)
+            self._trusted_host_adapter = insecure_adapter
+
+        self.mount("https://", secure_adapter)
+        self.mount("http://", insecure_adapter)
+
+        # Enable file:// urls
+        self.mount("file://", LocalFSAdapter())
+
+        for host in trusted_hosts:
+            self.add_trusted_host(host, suppress_logging=True)
+
+    def update_index_urls(self, new_index_urls: List[str]) -> None:
+        """
+        :param new_index_urls: New index urls to update the authentication
+            handler with.
+        """
+        self.auth.index_urls = new_index_urls
+
+    def add_trusted_host(
+        self, host: str, source: Optional[str] = None, suppress_logging: bool = False
+    ) -> None:
+        """
+        :param host: It is okay to provide a host that has previously been
+            added.
+        :param source: An optional source string, for logging where the host
+            string came from.
+        """
+        if not suppress_logging:
+            msg = f"adding trusted host: {host!r}"
+            if source is not None:
+                msg += f" (from {source})"
+            logger.info(msg)
+
+        parsed_host, parsed_port = parse_netloc(host)
+        if parsed_host is None:
+            raise ValueError(f"Trusted host URL must include a host part: {host!r}")
+        if (parsed_host, parsed_port) not in self.pip_trusted_origins:
+            self.pip_trusted_origins.append((parsed_host, parsed_port))
+
+        self.mount(
+            build_url_from_netloc(host, scheme="http") + "/", self._trusted_host_adapter
+        )
+        self.mount(build_url_from_netloc(host) + "/", self._trusted_host_adapter)
+        if not parsed_port:
+            self.mount(
+                build_url_from_netloc(host, scheme="http") + ":",
+                self._trusted_host_adapter,
+            )
+            # Mount wildcard ports for the same host.
+            self.mount(build_url_from_netloc(host) + ":", self._trusted_host_adapter)
+
+    def iter_secure_origins(self) -> Generator[SecureOrigin, None, None]:
+        yield from SECURE_ORIGINS
+        for host, port in self.pip_trusted_origins:
+            yield ("*", host, "*" if port is None else port)
+
+    def is_secure_origin(self, location: Link) -> bool:
+        # Determine if this url used a secure transport mechanism
+        parsed = urllib.parse.urlparse(str(location))
+        origin_protocol, origin_host, origin_port = (
+            parsed.scheme,
+            parsed.hostname,
+            parsed.port,
+        )
+
+        # The protocol to use to see if the protocol matches.
+        # Don't count the repository type as part of the protocol: in
+        # cases such as "git+ssh", only use "ssh". (I.e., Only verify against
+        # the last scheme.)
+        origin_protocol = origin_protocol.rsplit("+", 1)[-1]
+
+        # Determine if our origin is a secure origin by looking through our
+        # hardcoded list of secure origins, as well as any additional ones
+        # configured on this PackageFinder instance.
+        for secure_origin in self.iter_secure_origins():
+            secure_protocol, secure_host, secure_port = secure_origin
+            if origin_protocol != secure_protocol and secure_protocol != "*":
+                continue
+
+            try:
+                addr = ipaddress.ip_address(origin_host or "")
+                network = ipaddress.ip_network(secure_host)
+            except ValueError:
+                # We don't have both a valid address or a valid network, so
+                # we'll check this origin against hostnames.
+                if (
+                    origin_host
+                    and origin_host.lower() != secure_host.lower()
+                    and secure_host != "*"
+                ):
+                    continue
+            else:
+                # We have a valid address and network, so see if the address
+                # is contained within the network.
+                if addr not in network:
+                    continue
+
+            # Check to see if the port matches.
+            if (
+                origin_port != secure_port
+                and secure_port != "*"
+                and secure_port is not None
+            ):
+                continue
+
+            # If we've gotten here, then this origin matches the current
+            # secure origin and we should return True
+            return True
+
+        # If we've gotten to this point, then the origin isn't secure and we
+        # will not accept it as a valid location to search. We will however
+        # log a warning that we are ignoring it.
+        logger.warning(
+            "The repository located at %s is not a trusted or secure host and "
+            "is being ignored. If this repository is available via HTTPS we "
+            "recommend you use HTTPS instead, otherwise you may silence "
+            "this warning and allow it anyway with '--trusted-host %s'.",
+            origin_host,
+            origin_host,
+        )
+
+        return False
+
+    def request(self, method: str, url: str, *args: Any, **kwargs: Any) -> Response:
+        # Allow setting a default timeout on a session
+        kwargs.setdefault("timeout", self.timeout)
+        # Allow setting a default proxies on a session
+        kwargs.setdefault("proxies", self.proxies)
+
+        # Dispatch the actual request
+        return super().request(method, url, *args, **kwargs)
+"""HTTP cache implementation."""
+
+import os
+from contextlib import contextmanager
+from datetime import datetime
+from typing import BinaryIO, Generator, Optional, Union
+
+from pip._vendor.cachecontrol.cache import SeparateBodyBaseCache
+from pip._vendor.cachecontrol.caches import SeparateBodyFileCache
+from pip._vendor.requests.models import Response
+
+from pip._internal.utils.filesystem import adjacent_tmp_file, replace
+from pip._internal.utils.misc import ensure_dir
+
+
+def is_from_cache(response: Response) -> bool:
+    return getattr(response, "from_cache", False)
+
+
+@contextmanager
+def suppressed_cache_errors() -> Generator[None, None, None]:
+    """If we can't access the cache then we can just skip caching and process
+    requests as if caching wasn't enabled.
+    """
+    try:
+        yield
+    except OSError:
+        pass
+
+
+class SafeFileCache(SeparateBodyBaseCache):
+    """
+    A file based cache which is safe to use even when the target directory may
+    not be accessible or writable.
+
+    There is a race condition when two processes try to write and/or read the
+    same entry at the same time, since each entry consists of two separate
+    files (https://github.com/psf/cachecontrol/issues/324).  We therefore have
+    additional logic that makes sure that both files to be present before
+    returning an entry; this fixes the read side of the race condition.
+
+    For the write side, we assume that the server will only ever return the
+    same data for the same URL, which ought to be the case for files pip is
+    downloading.  PyPI does not have a mechanism to swap out a wheel for
+    another wheel, for example.  If this assumption is not true, the
+    CacheControl issue will need to be fixed.
+    """
+
+    def __init__(self, directory: str) -> None:
+        assert directory is not None, "Cache directory must not be None."
+        super().__init__()
+        self.directory = directory
+
+    def _get_cache_path(self, name: str) -> str:
+        # From cachecontrol.caches.file_cache.FileCache._fn, brought into our
+        # class for backwards-compatibility and to avoid using a non-public
+        # method.
+        hashed = SeparateBodyFileCache.encode(name)
+        parts = list(hashed[:5]) + [hashed]
+        return os.path.join(self.directory, *parts)
+
+    def get(self, key: str) -> Optional[bytes]:
+        # The cache entry is only valid if both metadata and body exist.
+        metadata_path = self._get_cache_path(key)
+        body_path = metadata_path + ".body"
+        if not (os.path.exists(metadata_path) and os.path.exists(body_path)):
+            return None
+        with suppressed_cache_errors():
+            with open(metadata_path, "rb") as f:
+                return f.read()
+
+    def _write(self, path: str, data: bytes) -> None:
+        with suppressed_cache_errors():
+            ensure_dir(os.path.dirname(path))
+
+            with adjacent_tmp_file(path) as f:
+                f.write(data)
+                # Inherit the read/write permissions of the cache directory
+                # to enable multi-user cache use-cases.
+                mode = (
+                    os.stat(self.directory).st_mode
+                    & 0o666  # select read/write permissions of cache directory
+                    | 0o600  # set owner read/write permissions
+                )
+                # Change permissions only if there is no risk of following a symlink.
+                if os.chmod in os.supports_fd:
+                    os.chmod(f.fileno(), mode)
+                elif os.chmod in os.supports_follow_symlinks:
+                    os.chmod(f.name, mode, follow_symlinks=False)
+
+            replace(f.name, path)
+
+    def set(
+        self, key: str, value: bytes, expires: Union[int, datetime, None] = None
+    ) -> None:
+        path = self._get_cache_path(key)
+        self._write(path, value)
+
+    def delete(self, key: str) -> None:
+        path = self._get_cache_path(key)
+        with suppressed_cache_errors():
+            os.remove(path)
+        with suppressed_cache_errors():
+            os.remove(path + ".body")
+
+    def get_body(self, key: str) -> Optional[BinaryIO]:
+        # The cache entry is only valid if both metadata and body exist.
+        metadata_path = self._get_cache_path(key)
+        body_path = metadata_path + ".body"
+        if not (os.path.exists(metadata_path) and os.path.exists(body_path)):
+            return None
+        with suppressed_cache_errors():
+            return open(body_path, "rb")
+
+    def set_body(self, key: str, body: bytes) -> None:
+        path = self._get_cache_path(key) + ".body"
+        self._write(path, body)
+"""Contains purely network-related utilities."""
+from typing import Dict, Generator
+
+from pip._vendor.requests.models import Response
+
+from pip._internal.exceptions import NetworkConnectionError
+
+# The following comments and HTTP headers were originally added by
+# Donald Stufft in git commit 22c562429a61bb77172039e480873fb239dd8c03.
+#
+# We use Accept-Encoding: identity here because requests defaults to
+# accepting compressed responses. This breaks in a variety of ways
+# depending on how the server is configured.
+# - Some servers will notice that the file isn't a compressible file
+#   and will leave the file alone and with an empty Content-Encoding
+# - Some servers will notice that the file is already compressed and
+#   will leave the file alone, adding a Content-Encoding: gzip header
+# - Some servers won't notice anything at all and will take a file
+#   that's already been compressed and compress it again, and set
+#   the Content-Encoding: gzip header
+# By setting this to request only the identity encoding we're hoping
+# to eliminate the third case.  Hopefully there does not exist a server
+# which when given a file will notice it is already compressed and that
+# you're not asking for a compressed file and will then decompress it
+# before sending because if that's the case I don't think it'll ever be
+# possible to make this work.
+HEADERS: Dict[str, str] = {"Accept-Encoding": "identity"}
+
+DOWNLOAD_CHUNK_SIZE = 256 * 1024
+
+
+def raise_for_status(resp: Response) -> None:
+    http_error_msg = ""
+    if isinstance(resp.reason, bytes):
+        # We attempt to decode utf-8 first because some servers
+        # choose to localize their reason strings. If the string
+        # isn't utf-8, we fall back to iso-8859-1 for all other
+        # encodings.
+        try:
+            reason = resp.reason.decode("utf-8")
+        except UnicodeDecodeError:
+            reason = resp.reason.decode("iso-8859-1")
+    else:
+        reason = resp.reason
+
+    if 400 <= resp.status_code < 500:
+        http_error_msg = (
+            f"{resp.status_code} Client Error: {reason} for url: {resp.url}"
+        )
+
+    elif 500 <= resp.status_code < 600:
+        http_error_msg = (
+            f"{resp.status_code} Server Error: {reason} for url: {resp.url}"
+        )
+
+    if http_error_msg:
+        raise NetworkConnectionError(http_error_msg, response=resp)
+
+
+def response_chunks(
+    response: Response, chunk_size: int = DOWNLOAD_CHUNK_SIZE
+) -> Generator[bytes, None, None]:
+    """Given a requests Response, provide the data chunks."""
+    try:
+        # Special case for urllib3.
+        for chunk in response.raw.stream(
+            chunk_size,
+            # We use decode_content=False here because we don't
+            # want urllib3 to mess with the raw bytes we get
+            # from the server. If we decompress inside of
+            # urllib3 then we cannot verify the checksum
+            # because the checksum will be of the compressed
+            # file. This breakage will only occur if the
+            # server adds a Content-Encoding header, which
+            # depends on how the server was configured:
+            # - Some servers will notice that the file isn't a
+            #   compressible file and will leave the file alone
+            #   and with an empty Content-Encoding
+            # - Some servers will notice that the file is
+            #   already compressed and will leave the file
+            #   alone and will add a Content-Encoding: gzip
+            #   header
+            # - Some servers won't notice anything at all and
+            #   will take a file that's already been compressed
+            #   and compress it again and set the
+            #   Content-Encoding: gzip header
+            #
+            # By setting this not to decode automatically we
+            # hope to eliminate problems with the second case.
+            decode_content=False,
+        ):
+            yield chunk
+    except AttributeError:
+        # Standard file-like object.
+        while True:
+            chunk = response.raw.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+"""Lazy ZIP over HTTP"""
+
+__all__ = ["HTTPRangeRequestUnsupported", "dist_from_wheel_url"]
+
+from bisect import bisect_left, bisect_right
+from contextlib import contextmanager
+from tempfile import NamedTemporaryFile
+from typing import Any, Dict, Generator, List, Optional, Tuple
+from zipfile import BadZipFile, ZipFile
+
+from pip._vendor.packaging.utils import canonicalize_name
+from pip._vendor.requests.models import CONTENT_CHUNK_SIZE, Response
+
+from pip._internal.metadata import BaseDistribution, MemoryWheel, get_wheel_distribution
+from pip._internal.network.session import PipSession
+from pip._internal.network.utils import HEADERS, raise_for_status, response_chunks
+
+
+class HTTPRangeRequestUnsupported(Exception):
+    pass
+
+
+def dist_from_wheel_url(name: str, url: str, session: PipSession) -> BaseDistribution:
+    """Return a distribution object from the given wheel URL.
+
+    This uses HTTP range requests to only fetch the portion of the wheel
+    containing metadata, just enough for the object to be constructed.
+    If such requests are not supported, HTTPRangeRequestUnsupported
+    is raised.
+    """
+    with LazyZipOverHTTP(url, session) as zf:
+        # For read-only ZIP files, ZipFile only needs methods read,
+        # seek, seekable and tell, not the whole IO protocol.
+        wheel = MemoryWheel(zf.name, zf)  # type: ignore
+        # After context manager exit, wheel.name
+        # is an invalid file by intention.
+        return get_wheel_distribution(wheel, canonicalize_name(name))
+
+
+class LazyZipOverHTTP:
+    """File-like object mapped to a ZIP file over HTTP.
+
+    This uses HTTP range requests to lazily fetch the file's content,
+    which is supposed to be fed to ZipFile.  If such requests are not
+    supported by the server, raise HTTPRangeRequestUnsupported
+    during initialization.
+    """
+
+    def __init__(
+        self, url: str, session: PipSession, chunk_size: int = CONTENT_CHUNK_SIZE
+    ) -> None:
+        head = session.head(url, headers=HEADERS)
+        raise_for_status(head)
+        assert head.status_code == 200
+        self._session, self._url, self._chunk_size = session, url, chunk_size
+        self._length = int(head.headers["Content-Length"])
+        self._file = NamedTemporaryFile()
+        self.truncate(self._length)
+        self._left: List[int] = []
+        self._right: List[int] = []
+        if "bytes" not in head.headers.get("Accept-Ranges", "none"):
+            raise HTTPRangeRequestUnsupported("range request is not supported")
+        self._check_zip()
+
+    @property
+    def mode(self) -> str:
+        """Opening mode, which is always rb."""
+        return "rb"
+
+    @property
+    def name(self) -> str:
+        """Path to the underlying file."""
+        return self._file.name
+
+    def seekable(self) -> bool:
+        """Return whether random access is supported, which is True."""
+        return True
+
+    def close(self) -> None:
+        """Close the file."""
+        self._file.close()
+
+    @property
+    def closed(self) -> bool:
+        """Whether the file is closed."""
+        return self._file.closed
+
+    def read(self, size: int = -1) -> bytes:
+        """Read up to size bytes from the object and return them.
+
+        As a convenience, if size is unspecified or -1,
+        all bytes until EOF are returned.  Fewer than
+        size bytes may be returned if EOF is reached.
+        """
+        download_size = max(size, self._chunk_size)
+        start, length = self.tell(), self._length
+        stop = length if size < 0 else min(start + download_size, length)
+        start = max(0, stop - download_size)
+        self._download(start, stop - 1)
+        return self._file.read(size)
+
+    def readable(self) -> bool:
+        """Return whether the file is readable, which is True."""
+        return True
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        """Change stream position and return the new absolute position.
+
+        Seek to offset relative position indicated by whence:
+        * 0: Start of stream (the default).  pos should be >= 0;
+        * 1: Current position - pos may be negative;
+        * 2: End of stream - pos usually negative.
+        """
+        return self._file.seek(offset, whence)
+
+    def tell(self) -> int:
+        """Return the current position."""
+        return self._file.tell()
+
+    def truncate(self, size: Optional[int] = None) -> int:
+        """Resize the stream to the given size in bytes.
+
+        If size is unspecified resize to the current position.
+        The current stream position isn't changed.
+
+        Return the new file size.
+        """
+        return self._file.truncate(size)
+
+    def writable(self) -> bool:
+        """Return False."""
+        return False
+
+    def __enter__(self) -> "LazyZipOverHTTP":
+        self._file.__enter__()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._file.__exit__(*exc)
+
+    @contextmanager
+    def _stay(self) -> Generator[None, None, None]:
+        """Return a context manager keeping the position.
+
+        At the end of the block, seek back to original position.
+        """
+        pos = self.tell()
+        try:
+            yield
+        finally:
+            self.seek(pos)
+
+    def _check_zip(self) -> None:
+        """Check and download until the file is a valid ZIP."""
+        end = self._length - 1
+        for start in reversed(range(0, end, self._chunk_size)):
+            self._download(start, end)
+            with self._stay():
+                try:
+                    # For read-only ZIP files, ZipFile only needs
+                    # methods read, seek, seekable and tell.
+                    ZipFile(self)
+                except BadZipFile:
+                    pass
+                else:
+                    break
+
+    def _stream_response(
+        self, start: int, end: int, base_headers: Dict[str, str] = HEADERS
+    ) -> Response:
+        """Return HTTP response to a range request from start to end."""
+        headers = base_headers.copy()
+        headers["Range"] = f"bytes={start}-{end}"
+        # TODO: Get range requests to be correctly cached
+        headers["Cache-Control"] = "no-cache"
+        return self._session.get(self._url, headers=headers, stream=True)
+
+    def _merge(
+        self, start: int, end: int, left: int, right: int
+    ) -> Generator[Tuple[int, int], None, None]:
+        """Return a generator of intervals to be fetched.
+
+        Args:
+            start (int): Start of needed interval
+            end (int): End of needed interval
+            left (int): Index of first overlapping downloaded data
+            right (int): Index after last overlapping downloaded data
+        """
+        lslice, rslice = self._left[left:right], self._right[left:right]
+        i = start = min([start] + lslice[:1])
+        end = max([end] + rslice[-1:])
+        for j, k in zip(lslice, rslice):
+            if j > i:
+                yield i, j - 1
+            i = k + 1
+        if i <= end:
+            yield i, end
+        self._left[left:right], self._right[left:right] = [start], [end]
+
+    def _download(self, start: int, end: int) -> None:
+        """Download bytes from start to end inclusively."""
+        with self._stay():
+            left = bisect_left(self._right, start)
+            right = bisect_right(self._left, end)
+            for start, end in self._merge(start, end, left, right):
+                response = self._stream_response(start, end)
+                response.raise_for_status()
+                self.seek(start)
+                for chunk in response_chunks(response, self._chunk_size):
+                    self._file.write(chunk)
+"""Cache Management"""
+
+import hashlib
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from pip._vendor.packaging.tags import Tag, interpreter_name, interpreter_version
+from pip._vendor.packaging.utils import canonicalize_name
+
+from pip._internal.exceptions import InvalidWheelFilename
+from pip._internal.models.direct_url import DirectUrl
+from pip._internal.models.link import Link
+from pip._internal.models.wheel import Wheel
+from pip._internal.utils.temp_dir import TempDirectory, tempdir_kinds
+from pip._internal.utils.urls import path_to_url
+
+logger = logging.getLogger(__name__)
+
+ORIGIN_JSON_NAME = "origin.json"
+
+
+def _hash_dict(d: Dict[str, str]) -> str:
+    """Return a stable sha224 of a dictionary."""
+    s = json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha224(s.encode("ascii")).hexdigest()
+
+
+class Cache:
+    """An abstract class - provides cache directories for data from links
+
+    :param cache_dir: The root of the cache.
+    """
+
+    def __init__(self, cache_dir: str) -> None:
+        super().__init__()
+        assert not cache_dir or os.path.isabs(cache_dir)
+        self.cache_dir = cache_dir or None
+
+    def _get_cache_path_parts(self, link: Link) -> List[str]:
+        """Get parts of part that must be os.path.joined with cache_dir"""
+
+        # We want to generate an url to use as our cache key, we don't want to
+        # just reuse the URL because it might have other items in the fragment
+        # and we don't care about those.
+        key_parts = {"url": link.url_without_fragment}
+        if link.hash_name is not None and link.hash is not None:
+            key_parts[link.hash_name] = link.hash
+        if link.subdirectory_fragment:
+            key_parts["subdirectory"] = link.subdirectory_fragment
+
+        # Include interpreter name, major and minor version in cache key
+        # to cope with ill-behaved sdists that build a different wheel
+        # depending on the python version their setup.py is being run on,
+        # and don't encode the difference in compatibility tags.
+        # https://github.com/pypa/pip/issues/7296
+        key_parts["interpreter_name"] = interpreter_name()
+        key_parts["interpreter_version"] = interpreter_version()
+
+        # Encode our key url with sha224, we'll use this because it has similar
+        # security properties to sha256, but with a shorter total output (and
+        # thus less secure). However the differences don't make a lot of
+        # difference for our use case here.
+        hashed = _hash_dict(key_parts)
+
+        # We want to nest the directories some to prevent having a ton of top
+        # level directories where we might run out of sub directories on some
+        # FS.
+        parts = [hashed[:2], hashed[2:4], hashed[4:6], hashed[6:]]
+
+        return parts
+
+    def _get_candidates(self, link: Link, canonical_package_name: str) -> List[Any]:
+        can_not_cache = not self.cache_dir or not canonical_package_name or not link
+        if can_not_cache:
+            return []
+
+        path = self.get_path_for_link(link)
+        if os.path.isdir(path):
+            return [(candidate, path) for candidate in os.listdir(path)]
+        return []
+
+    def get_path_for_link(self, link: Link) -> str:
+        """Return a directory to store cached items in for link."""
+        raise NotImplementedError()
+
+    def get(
+        self,
+        link: Link,
+        package_name: Optional[str],
+        supported_tags: List[Tag],
+    ) -> Link:
+        """Returns a link to a cached item if it exists, otherwise returns the
+        passed link.
+        """
+        raise NotImplementedError()
+
+
+class SimpleWheelCache(Cache):
+    """A cache of wheels for future installs."""
+
+    def __init__(self, cache_dir: str) -> None:
+        super().__init__(cache_dir)
+
+    def get_path_for_link(self, link: Link) -> str:
+        """Return a directory to store cached wheels for link
+
+        Because there are M wheels for any one sdist, we provide a directory
+        to cache them in, and then consult that directory when looking up
+        cache hits.
+
+        We only insert things into the cache if they have plausible version
+        numbers, so that we don't contaminate the cache with things that were
+        not unique. E.g. ./package might have dozens of installs done for it
+        and build a version of 0.0...and if we built and cached a wheel, we'd
+        end up using the same wheel even if the source has been edited.
+
+        :param link: The link of the sdist for which this will cache wheels.
+        """
+        parts = self._get_cache_path_parts(link)
+        assert self.cache_dir
+        # Store wheels within the root cache_dir
+        return os.path.join(self.cache_dir, "wheels", *parts)
+
+    def get(
+        self,
+        link: Link,
+        package_name: Optional[str],
+        supported_tags: List[Tag],
+    ) -> Link:
+        candidates = []
+
+        if not package_name:
+            return link
+
+        canonical_package_name = canonicalize_name(package_name)
+        for wheel_name, wheel_dir in self._get_candidates(link, canonical_package_name):
+            try:
+                wheel = Wheel(wheel_name)
+            except InvalidWheelFilename:
+                continue
+            if canonicalize_name(wheel.name) != canonical_package_name:
+                logger.debug(
+                    "Ignoring cached wheel %s for %s as it "
+                    "does not match the expected distribution name %s.",
+                    wheel_name,
+                    link,
+                    package_name,
+                )
+                continue
+            if not wheel.supported(supported_tags):
+                # Built for a different python/arch/etc
+                continue
+            candidates.append(
+                (
+                    wheel.support_index_min(supported_tags),
+                    wheel_name,
+                    wheel_dir,
+                )
+            )
+
+        if not candidates:
+            return link
+
+        _, wheel_name, wheel_dir = min(candidates)
+        return Link(path_to_url(os.path.join(wheel_dir, wheel_name)))
+
+
+class EphemWheelCache(SimpleWheelCache):
+    """A SimpleWheelCache that creates it's own temporary cache directory"""
+
+    def __init__(self) -> None:
+        self._temp_dir = TempDirectory(
+            kind=tempdir_kinds.EPHEM_WHEEL_CACHE,
+            globally_managed=True,
+        )
+
+        super().__init__(self._temp_dir.path)
+
+
+class CacheEntry:
+    def __init__(
+        self,
+        link: Link,
+        persistent: bool,
+    ):
+        self.link = link
+        self.persistent = persistent
+        self.origin: Optional[DirectUrl] = None
+        origin_direct_url_path = Path(self.link.file_path).parent / ORIGIN_JSON_NAME
+        if origin_direct_url_path.exists():
+            try:
+                self.origin = DirectUrl.from_json(
+                    origin_direct_url_path.read_text(encoding="utf-8")
+                )
+            except Exception as e:
+                logger.warning(
+                    "Ignoring invalid cache entry origin file %s for %s (%s)",
+                    origin_direct_url_path,
+                    link.filename,
+                    e,
+                )
+
+
+class WheelCache(Cache):
+    """Wraps EphemWheelCache and SimpleWheelCache into a single Cache
+
+    This Cache allows for gracefully degradation, using the ephem wheel cache
+    when a certain link is not found in the simple wheel cache first.
+    """
+
+    def __init__(self, cache_dir: str) -> None:
+        super().__init__(cache_dir)
+        self._wheel_cache = SimpleWheelCache(cache_dir)
+        self._ephem_cache = EphemWheelCache()
+
+    def get_path_for_link(self, link: Link) -> str:
+        return self._wheel_cache.get_path_for_link(link)
+
+    def get_ephem_path_for_link(self, link: Link) -> str:
+        return self._ephem_cache.get_path_for_link(link)
+
+    def get(
+        self,
+        link: Link,
+        package_name: Optional[str],
+        supported_tags: List[Tag],
+    ) -> Link:
+        cache_entry = self.get_cache_entry(link, package_name, supported_tags)
+        if cache_entry is None:
+            return link
+        return cache_entry.link
+
+    def get_cache_entry(
+        self,
+        link: Link,
+        package_name: Optional[str],
+        supported_tags: List[Tag],
+    ) -> Optional[CacheEntry]:
+        """Returns a CacheEntry with a link to a cached item if it exists or
+        None. The cache entry indicates if the item was found in the persistent
+        or ephemeral cache.
+        """
+        retval = self._wheel_cache.get(
+            link=link,
+            package_name=package_name,
+            supported_tags=supported_tags,
+        )
+        if retval is not link:
+            return CacheEntry(retval, persistent=True)
+
+        retval = self._ephem_cache.get(
+            link=link,
+            package_name=package_name,
+            supported_tags=supported_tags,
+        )
+        if retval is not link:
+            return CacheEntry(retval, persistent=False)
+
+        return None
+
+    @staticmethod
+    def record_download_origin(cache_dir: str, download_info: DirectUrl) -> None:
+        origin_path = Path(cache_dir) / ORIGIN_JSON_NAME
+        if origin_path.exists():
+            try:
+                origin = DirectUrl.from_json(origin_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning(
+                    "Could not read origin file %s in cache entry (%s). "
+                    "Will attempt to overwrite it.",
+                    origin_path,
+                    e,
+                )
+            else:
+                # TODO: use DirectUrl.equivalent when
+                # https://github.com/pypa/pip/pull/10564 is merged.
+                if origin.url != download_info.url:
+                    logger.warning(
+                        "Origin URL %s in cache entry %s does not match download URL "
+                        "%s. This is likely a pip bug or a cache corruption issue. "
+                        "Will overwrite it with the new value.",
+                        origin.url,
+                        cache_dir,
+                        download_info.url,
+                    )
+        origin_path.write_text(download_info.to_json(), encoding="utf-8")
+from typing import List, Optional
+
+from pip._internal.utils import _log
+
+# init_logging() must be called before any call to logging.getLogger()
+# which happens at import of most modules.
+_log.init_logging()
+
+
+def main(args: Optional[List[str]] = None) -> int:
+    """This is preserved for old console scripts that may still be referencing
+    it.
+
+    For additional details, see https://github.com/pypa/pip/issues/7498.
+    """
+    from pip._internal.utils.entrypoints import _wrapper
+
+    return _wrapper(args)
+import contextlib
+import errno
+import logging
+import logging.handlers
+import os
+import sys
+import threading
+from dataclasses import dataclass
+from io import TextIOWrapper
+from logging import Filter
+from typing import Any, ClassVar, Generator, List, Optional, Type
+
+from pip._vendor.rich.console import (
+    Console,
+    ConsoleOptions,
+    ConsoleRenderable,
+    RenderableType,
+    RenderResult,
+    RichCast,
+)
+from pip._vendor.rich.highlighter import NullHighlighter
+from pip._vendor.rich.logging import RichHandler
+from pip._vendor.rich.segment import Segment
+from pip._vendor.rich.style import Style
+
+from pip._internal.utils._log import VERBOSE, getLogger
+from pip._internal.utils.compat import WINDOWS
+from pip._internal.utils.deprecation import DEPRECATION_MSG_PREFIX
+from pip._internal.utils.misc import ensure_dir
+
+_log_state = threading.local()
+_stdout_console = None
+_stderr_console = None
+subprocess_logger = getLogger("pip.subprocessor")
+
+
+class BrokenStdoutLoggingError(Exception):
+    """
+    Raised if BrokenPipeError occurs for the stdout stream while logging.
+    """
+
+
+def _is_broken_pipe_error(exc_class: Type[BaseException], exc: BaseException) -> bool:
+    if exc_class is BrokenPipeError:
+        return True
+
+    # On Windows, a broken pipe can show up as EINVAL rather than EPIPE:
+    # https://bugs.python.org/issue19612
+    # https://bugs.python.org/issue30418
+    if not WINDOWS:
+        return False
+
+    return isinstance(exc, OSError) and exc.errno in (errno.EINVAL, errno.EPIPE)
+
+
+@contextlib.contextmanager
+def indent_log(num: int = 2) -> Generator[None, None, None]:
+    """
+    A context manager which will cause the log output to be indented for any
+    log messages emitted inside it.
+    """
+    # For thread-safety
+    _log_state.indentation = get_indentation()
+    _log_state.indentation += num
+    try:
+        yield
+    finally:
+        _log_state.indentation -= num
+
+
+def get_indentation() -> int:
+    return getattr(_log_state, "indentation", 0)
+
+
+class IndentingFormatter(logging.Formatter):
+    default_time_format = "%Y-%m-%dT%H:%M:%S"
+
+    def __init__(
+        self,
+        *args: Any,
+        add_timestamp: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """
+        A logging.Formatter that obeys the indent_log() context manager.
+
+        :param add_timestamp: A bool indicating output lines should be prefixed
+            with their record's timestamp.
+        """
+        self.add_timestamp = add_timestamp
+        super().__init__(*args, **kwargs)
+
+    def get_message_start(self, formatted: str, levelno: int) -> str:
+        """
+        Return the start of the formatted log message (not counting the
+        prefix to add to each line).
+        """
+        if levelno < logging.WARNING:
+            return ""
+        if formatted.startswith(DEPRECATION_MSG_PREFIX):
+            # Then the message already has a prefix.  We don't want it to
+            # look like "WARNING: DEPRECATION: ...."
+            return ""
+        if levelno < logging.ERROR:
+            return "WARNING: "
+
+        return "ERROR: "
+
+    def format(self, record: logging.LogRecord) -> str:
+        """
+        Calls the standard formatter, but will indent all of the log message
+        lines by our current indentation level.
+        """
+        formatted = super().format(record)
+        message_start = self.get_message_start(formatted, record.levelno)
+        formatted = message_start + formatted
+
+        prefix = ""
+        if self.add_timestamp:
+            prefix = f"{self.formatTime(record)} "
+        prefix += " " * get_indentation()
+        formatted = "".join([prefix + line for line in formatted.splitlines(True)])
+        return formatted
+
+
+@dataclass
+class IndentedRenderable:
+    renderable: RenderableType
+    indent: int
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        segments = console.render(self.renderable, options)
+        lines = Segment.split_lines(segments)
+        for line in lines:
+            yield Segment(" " * self.indent)
+            yield from line
+            yield Segment("\n")
+
+
+class PipConsole(Console):
+    def on_broken_pipe(self) -> None:
+        # Reraise the original exception, rich 13.8.0+ exits by default
+        # instead, preventing our handler from firing.
+        raise BrokenPipeError() from None
+
+
+def get_console(*, stderr: bool = False) -> Console:
+    if stderr:
+        assert _stderr_console is not None, "stderr rich console is missing!"
+        return _stderr_console
+    else:
+        assert _stdout_console is not None, "stdout rich console is missing!"
+        return _stdout_console
+
+
+class RichPipStreamHandler(RichHandler):
+    KEYWORDS: ClassVar[Optional[List[str]]] = []
+
+    def __init__(self, console: Console) -> None:
+        super().__init__(
+            console=console,
+            show_time=False,
+            show_level=False,
+            show_path=False,
+            highlighter=NullHighlighter(),
+        )
+
+    # Our custom override on Rich's logger, to make things work as we need them to.
+    def emit(self, record: logging.LogRecord) -> None:
+        style: Optional[Style] = None
+
+        # If we are given a diagnostic error to present, present it with indentation.
+        if getattr(record, "rich", False):
+            assert isinstance(record.args, tuple)
+            (rich_renderable,) = record.args
+            assert isinstance(
+                rich_renderable, (ConsoleRenderable, RichCast, str)
+            ), f"{rich_renderable} is not rich-console-renderable"
+
+            renderable: RenderableType = IndentedRenderable(
+                rich_renderable, indent=get_indentation()
+            )
+        else:
+            message = self.format(record)
+            renderable = self.render_message(record, message)
+            if record.levelno is not None:
+                if record.levelno >= logging.ERROR:
+                    style = Style(color="red")
+                elif record.levelno >= logging.WARNING:
+                    style = Style(color="yellow")
+
+        try:
+            self.console.print(renderable, overflow="ignore", crop=False, style=style)
+        except Exception:
+            self.handleError(record)
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        """Called when logging is unable to log some output."""
+
+        exc_class, exc = sys.exc_info()[:2]
+        # If a broken pipe occurred while calling write() or flush() on the
+        # stdout stream in logging's Handler.emit(), then raise our special
+        # exception so we can handle it in main() instead of logging the
+        # broken pipe error and continuing.
+        if (
+            exc_class
+            and exc
+            and self.console.file is sys.stdout
+            and _is_broken_pipe_error(exc_class, exc)
+        ):
+            raise BrokenStdoutLoggingError()
+
+        return super().handleError(record)
+
+
+class BetterRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    def _open(self) -> TextIOWrapper:
+        ensure_dir(os.path.dirname(self.baseFilename))
+        return super()._open()
+
+
+class MaxLevelFilter(Filter):
+    def __init__(self, level: int) -> None:
+        self.level = level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < self.level
+
+
+class ExcludeLoggerFilter(Filter):
+    """
+    A logging Filter that excludes records from a logger (or its children).
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # The base Filter class allows only records from a logger (or its
+        # children).
+        return not super().filter(record)
+
+
+def setup_logging(verbosity: int, no_color: bool, user_log_file: Optional[str]) -> int:
+    """Configures and sets up all of the logging
+
+    Returns the requested logging level, as its integer value.
+    """
+
+    # Determine the level to be logging at.
+    if verbosity >= 2:
+        level_number = logging.DEBUG
+    elif verbosity == 1:
+        level_number = VERBOSE
+    elif verbosity == -1:
+        level_number = logging.WARNING
+    elif verbosity == -2:
+        level_number = logging.ERROR
+    elif verbosity <= -3:
+        level_number = logging.CRITICAL
+    else:
+        level_number = logging.INFO
+
+    level = logging.getLevelName(level_number)
+
+    # The "root" logger should match the "console" level *unless* we also need
+    # to log to a user log file.
+    include_user_log = user_log_file is not None
+    if include_user_log:
+        additional_log_file = user_log_file
+        root_level = "DEBUG"
+    else:
+        additional_log_file = "/dev/null"
+        root_level = level
+
+    # Disable any logging besides WARNING unless we have DEBUG level logging
+    # enabled for vendored libraries.
+    vendored_log_level = "WARNING" if level in ["INFO", "ERROR"] else "DEBUG"
+
+    # Shorthands for clarity
+    handler_classes = {
+        "stream": "pip._internal.utils.logging.RichPipStreamHandler",
+        "file": "pip._internal.utils.logging.BetterRotatingFileHandler",
+    }
+    handlers = ["console", "console_errors", "console_subprocess"] + (
+        ["user_log"] if include_user_log else []
+    )
+    global _stdout_console, stderr_console
+    _stdout_console = PipConsole(file=sys.stdout, no_color=no_color, soft_wrap=True)
+    _stderr_console = PipConsole(file=sys.stderr, no_color=no_color, soft_wrap=True)
+
+    logging.config.dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "filters": {
+                "exclude_warnings": {
+                    "()": "pip._internal.utils.logging.MaxLevelFilter",
+                    "level": logging.WARNING,
+                },
+                "restrict_to_subprocess": {
+                    "()": "logging.Filter",
+                    "name": subprocess_logger.name,
+                },
+                "exclude_subprocess": {
+                    "()": "pip._internal.utils.logging.ExcludeLoggerFilter",
+                    "name": subprocess_logger.name,
+                },
+            },
+            "formatters": {
+                "indent": {
+                    "()": IndentingFormatter,
+                    "format": "%(message)s",
+                },
+                "indent_with_timestamp": {
+                    "()": IndentingFormatter,
+                    "format": "%(message)s",
+                    "add_timestamp": True,
+                },
+            },
+            "handlers": {
+                "console": {
+                    "level": level,
+                    "class": handler_classes["stream"],
+                    "console": _stdout_console,
+                    "filters": ["exclude_subprocess", "exclude_warnings"],
+                    "formatter": "indent",
+                },
+                "console_errors": {
+                    "level": "WARNING",
+                    "class": handler_classes["stream"],
+                    "console": _stderr_console,
+                    "filters": ["exclude_subprocess"],
+                    "formatter": "indent",
+                },
+                # A handler responsible for logging to the console messages
+                # from the "subprocessor" logger.
+                "console_subprocess": {
+                    "level": level,
+                    "class": handler_classes["stream"],
+                    "console": _stderr_console,
+                    "filters": ["restrict_to_subprocess"],
+                    "formatter": "indent",
+                },
+                "user_log": {
+                    "level": "DEBUG",
+                    "class": handler_classes["file"],
+                    "filename": additional_log_file,
+                    "encoding": "utf-8",
+                    "delay": True,
+                    "formatter": "indent_with_timestamp",
+                },
+            },
+            "root": {
+                "level": root_level,
+                "handlers": handlers,
+            },
+            "loggers": {"pip._vendor": {"level": vendored_log_level}},
+        }
+    )
+
+    return level_number
+import errno
+import getpass
+import hashlib
+import logging
+import os
+import posixpath
+import shutil
+import stat
+import sys
+import sysconfig
+import urllib.parse
+from dataclasses import dataclass
+from functools import partial
+from io import StringIO
+from itertools import filterfalse, tee, zip_longest
+from pathlib import Path
+from types import FunctionType, TracebackType
+from typing import (
+    Any,
+    BinaryIO,
+    Callable,
+    Generator,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    TextIO,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+)
+
+from pip._vendor.packaging.requirements import Requirement
+from pip._vendor.pyproject_hooks import BuildBackendHookCaller
+
+from pip import __version__
+from pip._internal.exceptions import CommandError, ExternallyManagedEnvironment
+from pip._internal.locations import get_major_minor_version
+from pip._internal.utils.compat import WINDOWS
+from pip._internal.utils.retry import retry
+from pip._internal.utils.virtualenv import running_under_virtualenv
+
+__all__ = [
+    "rmtree",
+    "display_path",
+    "backup_dir",
+    "ask",
+    "splitext",
+    "format_size",
+    "is_installable_dir",
+    "normalize_path",
+    "renames",
+    "get_prog",
+    "ensure_dir",
+    "remove_auth_from_url",
+    "check_externally_managed",
+    "ConfiguredBuildBackendHookCaller",
+]
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+ExcInfo = Tuple[Type[BaseException], BaseException, TracebackType]
+VersionInfo = Tuple[int, int, int]
+NetlocTuple = Tuple[str, Tuple[Optional[str], Optional[str]]]
+OnExc = Callable[[FunctionType, Path, BaseException], Any]
+OnErr = Callable[[FunctionType, Path, ExcInfo], Any]
+
+FILE_CHUNK_SIZE = 1024 * 1024
+
+
+def get_pip_version() -> str:
+    pip_pkg_dir = os.path.join(os.path.dirname(__file__), "..", "..")
+    pip_pkg_dir = os.path.abspath(pip_pkg_dir)
+
+    return f"pip {__version__} from {pip_pkg_dir} (python {get_major_minor_version()})"
+
+
+def normalize_version_info(py_version_info: Tuple[int, ...]) -> Tuple[int, int, int]:
+    """
+    Convert a tuple of ints representing a Python version to one of length
+    three.
+
+    :param py_version_info: a tuple of ints representing a Python version,
+        or None to specify no version. The tuple can have any length.
+
+    :return: a tuple of length three if `py_version_info` is non-None.
+        Otherwise, return `py_version_info` unchanged (i.e. None).
+    """
+    if len(py_version_info) < 3:
+        py_version_info += (3 - len(py_version_info)) * (0,)
+    elif len(py_version_info) > 3:
+        py_version_info = py_version_info[:3]
+
+    return cast("VersionInfo", py_version_info)
+
+
+def ensure_dir(path: str) -> None:
+    """os.path.makedirs without EEXIST."""
+    try:
+        os.makedirs(path)
+    except OSError as e:
+        # Windows can raise spurious ENOTEMPTY errors. See #6426.
+        if e.errno != errno.EEXIST and e.errno != errno.ENOTEMPTY:
+            raise
+
+
+def get_prog() -> str:
+    try:
+        prog = os.path.basename(sys.argv[0])
+        if prog in ("__main__.py", "-c"):
+            return f"{sys.executable} -m pip"
+        else:
+            return prog
+    except (AttributeError, TypeError, IndexError):
+        pass
+    return "pip"
+
+
+# Retry every half second for up to 3 seconds
+@retry(stop_after_delay=3, wait=0.5)
+def rmtree(
+    dir: str, ignore_errors: bool = False, onexc: Optional[OnExc] = None
+) -> None:
+    if ignore_errors:
+        onexc = _onerror_ignore
+    if onexc is None:
+        onexc = _onerror_reraise
+    handler: OnErr = partial(rmtree_errorhandler, onexc=onexc)
+    if sys.version_info >= (3, 12):
+        # See https://docs.python.org/3.12/whatsnew/3.12.html#shutil.
+        shutil.rmtree(dir, onexc=handler)  # type: ignore
+    else:
+        shutil.rmtree(dir, onerror=handler)  # type: ignore
+
+
+def _onerror_ignore(*_args: Any) -> None:
+    pass
+
+
+def _onerror_reraise(*_args: Any) -> None:
+    raise  # noqa: PLE0704 - Bare exception used to reraise existing exception
+
+
+def rmtree_errorhandler(
+    func: FunctionType,
+    path: Path,
+    exc_info: Union[ExcInfo, BaseException],
+    *,
+    onexc: OnExc = _onerror_reraise,
+) -> None:
+    """
+    `rmtree` error handler to 'force' a file remove (i.e. like `rm -f`).
+
+    * If a file is readonly then it's write flag is set and operation is
+      retried.
+
+    * `onerror` is the original callback from `rmtree(... onerror=onerror)`
+      that is chained at the end if the "rm -f" still fails.
+    """
+    try:
+        st_mode = os.stat(path).st_mode
+    except OSError:
+        # it's equivalent to os.path.exists
+        return
+
+    if not st_mode & stat.S_IWRITE:
+        # convert to read/write
+        try:
+            os.chmod(path, st_mode | stat.S_IWRITE)
+        except OSError:
+            pass
+        else:
+            # use the original function to repeat the operation
+            try:
+                func(path)
+                return
+            except OSError:
+                pass
+
+    if not isinstance(exc_info, BaseException):
+        _, exc_info, _ = exc_info
+    onexc(func, path, exc_info)
+
+
+def display_path(path: str) -> str:
+    """Gives the display value for a given path, making it relative to cwd
+    if possible."""
+    path = os.path.normcase(os.path.abspath(path))
+    if path.startswith(os.getcwd() + os.path.sep):
+        path = "." + path[len(os.getcwd()) :]
+    return path
+
+
+def backup_dir(dir: str, ext: str = ".bak") -> str:
+    """Figure out the name of a directory to back up the given dir to
+    (adding .bak, .bak2, etc)"""
+    n = 1
+    extension = ext
+    while os.path.exists(dir + extension):
+        n += 1
+        extension = ext + str(n)
+    return dir + extension
+
+
+def ask_path_exists(message: str, options: Iterable[str]) -> str:
+    for action in os.environ.get("PIP_EXISTS_ACTION", "").split():
+        if action in options:
+            return action
+    return ask(message, options)
+
+
+def _check_no_input(message: str) -> None:
+    """Raise an error if no input is allowed."""
+    if os.environ.get("PIP_NO_INPUT"):
+        raise Exception(
+            f"No input was expected ($PIP_NO_INPUT set); question: {message}"
+        )
+
+
+def ask(message: str, options: Iterable[str]) -> str:
+    """Ask the message interactively, with the given possible responses"""
+    while 1:
+        _check_no_input(message)
+        response = input(message)
+        response = response.strip().lower()
+        if response not in options:
+            print(
+                "Your response ({!r}) was not one of the expected responses: "
+                "{}".format(response, ", ".join(options))
+            )
+        else:
+            return response
