@@ -137,6 +137,15 @@ class BytePairEncoder:
     return new_ids
     
   def _text_to_bytes(self, text):
+      """
+      Convert text to bytes with utf-8, add special tokens and use GPT-2 regex for word splitting
+
+      Args:
+          text (str): The text to encode
+      
+      Returns:
+          ids[][]: The text encoded with utf-8 with special tokens and splitted.
+      """
       placeholder_to_id = {}
       
       for i, (token, token_id) in enumerate(self.special_tokens.items()):
