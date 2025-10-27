@@ -60,6 +60,10 @@ messages = [
 ids = tokenizer.encode(messages, mode="conversation")
 ```
 
+## Corpus d'entraînement
+
+Ajoutez vos fichiers texte (`.txt`) dans le dossier `/data`. Vous pourrez ensuite les sélectionner dans le visualiseur pour entraîner le tokenizer.
+
 ## Limites
 
 - Nécessite un corpus suffisamment large (erreur si vocab_size > paires disponibles)

@@ -63,6 +63,7 @@ Capture les unités linguistiques naturelles (mots, nombres, ponctuation) avec g
 │   ├── basic-usage.py     # Utilisation basique du BPE
 │   └── visualizer.py      # Interface Streamlit
 ├── data/
+│   ├── save/              # Sauvegardes post training
 │   ├── conversation/      # Exemple de conversation
 │   ├── *.txt              # Corpus d'entraînement d'exemple
 │   └── save/              # Modèles sauvegardés (.pkl)
