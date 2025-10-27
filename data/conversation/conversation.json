@@ -1,0 +1,18 @@
+{
+    "conversations":[
+        [
+            {
+                "role":"system",
+                "message":"Tu es un assistant"
+            },
+            {
+                "role":"user",
+                "message":"C'est quoi un mistral ?"
+            },
+            {
+                "role":"assistant",
+                "message":"Un mistral est un vent du nord catabatique !"
+            }
+        ]
+    ]
+}

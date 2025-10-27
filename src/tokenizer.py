@@ -1,6 +1,7 @@
 import regex as re
 import pickle
 from pathlib import Path
+import json
 
 class BytePairEncoder:
   """Byte-Pair Encoding algorithm."""
@@ -9,6 +10,13 @@ class BytePairEncoder:
     self.merges = {}
     self.vocab = {idx: bytes([idx]) for idx in range(256)}
     self.stats = {}
+    self.special_tokens = {
+      '<begin_of_text>': 100001,
+      '<end_of_text>': 100002,
+      '<im_start>': 100003,
+      '<im_sep>': 100004,
+      '<im_end>': 100005,
+    }
     
   def train(self, text, vocab_size):
     """
@@ -36,20 +44,28 @@ class BytePairEncoder:
     self.merges = merges
     self._create_vocab_with_merges()
 
-  def encode(self, text):
+  def encode(self, text, mode):
     """
     Encode the input model into a list of IDs
 
     Args:
+        mode (str: "conversation"|"document" )
         text (str): The text to encode.
         
     Returns:
         int[]: List of token IDs.
     """
+    if mode == "document":
+      text = f"<begin_of_text>{text}<end_of_text>"
+    elif mode == "conversation":
+      conversation = []
+      for message in text:
+        conversation.append(f"<im_start>{message['role']}<im_sep>{message['message']}<im_end>")
+      text = ''.join(conversation)
+
     tokens = self._text_to_bytes(text)
-    for pair, idx in sorted(self.merges.items(), key=lambda x: x [1]):
-      tokens = self._merge(tokens, pair, idx)
-        
+    for pair, idx in sorted(self.merges.items(), key=lambda x: x[1]):
+        tokens = self._merge(tokens, pair, idx)
     return [token for sublists in tokens for token in sublists]
 
   def decode(self, ids):
@@ -121,19 +137,31 @@ class BytePairEncoder:
     return new_ids
     
   def _text_to_bytes(self, text):
-    """
-    Convert text into a list of lists of byte IDs using the GPT-2 pattern.
-
-    Args:
-        text (str): The text to convert.
-    
-    Returns:
-        int[][]: List of lists of byte IDs for each text segment.
-    """
-    gpt2pat = re.compile(r"""\[speaker\d{3}:\]| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
-    splited_text = re.findall(gpt2pat, text)
-    ids = [list(map(int, item.encode('utf-8'))) for item in splited_text]
-    return ids
+      placeholder_to_id = {}
+      
+      for i, (token, token_id) in enumerate(self.special_tokens.items()):
+          placeholder = chr(0xE000 + i)
+          placeholder_to_id[placeholder] = token_id
+          text = text.replace(token, placeholder)
+      
+      placeholder_chars = ''.join(placeholder_to_id.keys())
+      split_pattern = f'([{re.escape(placeholder_chars)}])'
+      parts = re.split(split_pattern, text)
+      gpt2pat = re.compile(r""" ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+      
+      ids = []
+      for part in parts:
+          if not part:
+              continue
+          
+          if part in placeholder_to_id:
+              ids.append([placeholder_to_id[part]])
+          else:
+              splited_text = re.findall(gpt2pat, part)
+              for item in splited_text:
+                  ids.append(list(map(int, item.encode('utf-8'))))
+      
+      return ids
         
   def _get_stats(self, ids):
     """
@@ -160,4 +188,8 @@ class BytePairEncoder:
     vocab = {idx: bytes([idx]) for idx in range(256)}
     for (p0, p1), idx in self.merges.items():
         vocab[idx] = vocab[p0] + vocab[p1]
+        
+    for st,st_id  in self.special_tokens.items():
+      vocab[st_id] = st.encode('utf-8')
+      
     self.vocab = vocab
