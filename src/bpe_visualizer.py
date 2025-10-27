@@ -2,6 +2,7 @@ import streamlit as st
 import time
 from tokenizer import BytePairEncoder
 from pathlib import Path
+import json 
 
 st.set_page_config(page_title="BPE Visualizer", layout="wide")
 st.title("BPE Tokenizer Visualizer")
@@ -60,23 +61,86 @@ if st.session_state.bpe is not None:
     st.divider()
     col1, col2 = st.columns([1, 1], gap="large")
     
+    if training_option in text_area_content:
+        content = text_area_content[training_option]
+    else:
+        content = "Enter the text you want to encode."
+    
     with col1:
-        st.subheader("Texte à encoder")
-        user_text = st.text_area(
-            "Entre ton texte:",
-            value=text_area_content[training_option],
-            height="stretch",
-            label_visibility="collapsed"
-        )
+        col_name, col_select = st.columns([3, 2], gap="large")
+        with col_name:
+            st.markdown("<h3 style='padding:0'>Texte à encoder</h3>", unsafe_allow_html=True)
+        with col_select:
+            on = st.toggle("Conversation mode")
+        
+        if 'lines' not in st.session_state:
+            st.session_state.lines = [
+                {"role": "System", "message": "Tu es un assistant"}, 
+                {"role": "User", "message": "Qu'est ce que c'est un mistral ?"},
+                {"role": "Assistant", "message": "Le mistral est un vent du nord catabatique"}
+            ]
+
+        def delete_line(index):
+            st.session_state.lines.pop(index)
+
+        if on:
+            for i in range(len(st.session_state.lines)):
+                col_role, col_message = st.columns([1, 2])
+                
+                with col_role:
+                    st.session_state.lines[i]["role"] = st.selectbox(
+                        "Role :", 
+                        ("System", "User", "Assistant"), 
+                        index=["System", "User", "Assistant"].index(st.session_state.lines[i]["role"]),
+                        key=f"role_{i}",
+                        label_visibility="collapsed"
+                    )
+                
+                with col_message:
+                    st.session_state.lines[i]["message"] = st.text_input(
+                        "Content", 
+                        value=st.session_state.lines[i]["message"],
+                        key=f"text_{i}",
+                        label_visibility="collapsed"
+                    )
+
+            encoded_content = st.session_state.bpe.encode(st.session_state.lines, "conversation")
+            content = st.session_state.bpe.decode(encoded_content)
+            
+            user_text = st.text_area(
+                "Entre ton texte:",
+                value=content,
+                height="stretch",
+                label_visibility="collapsed",
+                disabled=True
+            )
+        else:
+            user_text = st.text_area(
+                "Entre ton texte:",
+                value=content,
+                height="stretch",
+                label_visibility="collapsed"
+            )
+                
         if len(user_text) < 1:
-            user_text["value"] = text_area_content[training_option],
+                user_text["value"] = content
         
     
     with col2:
         st.subheader("Tokens visualisés")
-        
+        if on:
+            mode = "conversation"
+            
+            try:
+                data_to_encode = json.loads(user_text)
+            except:
+                data_to_encode = st.session_state.lines
+        else:
+            mode = "document"
+            data_to_encode = user_text
+            
         if user_text:
-            encoded = st.session_state.bpe.encode(user_text)
+            encoded = st.session_state.bpe.encode(data_to_encode, mode)
             
             html_tokens = []
             for token_id in encoded:
@@ -112,7 +176,7 @@ if st.session_state.bpe is not None:
     st.subheader("Infos rapides")
     if user_text:
         start_time = time.time()
-        encoded = st.session_state.bpe.encode(user_text)
+        encoded = st.session_state.bpe.encode(data_to_encode, mode)
         encoding_time = (time.time() - start_time) * 1000
         
         original_bytes = len(user_text.encode('utf-8'))
