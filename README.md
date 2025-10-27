@@ -67,3 +67,11 @@ Ajoutez vos fichiers texte (`.txt`) dans le dossier `/data`. Vous pourrez ensuit
 ## Limites
 
 - Nécessite un corpus suffisamment large (erreur si vocab_size > paires disponibles)
+
+## Documentation
+
+Pour plus de détails sur le projet :
+
+- **[Architecture](./docs/ARCHITECTURE.md)** : Structure du code et design decisions
+- **[Vue d'ensemble](./docs/PROJECT_OVERVIEW.md)** : Contexte et objectifs du projet
+- **[Visualiseur](./docs/VISUALIZER.md)** : Guide détaillé de l'interface Streamlit
