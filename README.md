@@ -42,12 +42,12 @@ text = tokenizer.decode(ids)
 
 ### Installation depuis GitHub
 ```bash
-pip install git+https://github.com/ad-tr/byte-pair-encoding-tokenizer
+%pip install git+https://github.com/ad-tr/byte-pair-encoding-tokenizer
 ```
 
 ### Utilisation après installation
 ```python
-from bpe import BytePairEncoder
+from tokenizer import BytePairEncoder
 
 # Créer et entraîner un tokenizer
 tokenizer = BytePairEncoder()
