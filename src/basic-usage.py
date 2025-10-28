@@ -1,4 +1,4 @@
-from tokenizer import BytePairEncoder
+from bpe.tokenizer import BytePairEncoder
 import json
 
 # Utilisation générale
@@ -9,8 +9,8 @@ with open("./data/wikipedia-fr-sample.txt", "r") as f:
 ## Nous definissons le nombre de tokens que nous voulons dans notre vocabulaire.
 BPE.train(text, 400)
 ## Ensuite, nous pouvons sauvegarder les merges qui ont été effectués dans un fichier pickle.
-BPE.save("merges.pkl")
-## Pour la prochaine fois je pourrais utiliser BPE.load("merges.pkl") sans devoir utiliser BPE.train()
+BPE.save("./data/save/merges.pkl")
+## Pour la prochaine fois nous pourrons utiliser BPE.load("./data/save/merges.pkl") sans devoir utiliser BPE.train()
 
 ## Variables à encoder
 test = "Ceci est un mistral venant du nord et traversant le sud, il est chaud et lourd."
