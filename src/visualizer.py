@@ -1,6 +1,6 @@
 import streamlit as st
 import time
-from tokenizer import BytePairEncoder
+from bpe.tokenizer import BytePairEncoder
 from pathlib import Path
 import json 
 

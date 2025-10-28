@@ -2,10 +2,18 @@
 name = "bpe-tokenizer"
 version = "1.0.0"
 description = "Byte Pair Encoding tokenizer implementation from scratch"
+authors = [
+    {name = "Adrien TRANCHANT", email = "adrien@tranchant.ai"}
+]
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.8"
 dependencies = [
     "regex"
 ]
+
+[project.urls]
+Repository = "https://github.com/ad-tr/byte-pair-encoding-tokenizer"
 
 [project.optional-dependencies]
 viz = ["streamlit"]
@@ -13,3 +21,6 @@ viz = ["streamlit"]
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

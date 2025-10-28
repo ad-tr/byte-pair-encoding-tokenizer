@@ -84,26 +84,24 @@ class BytePairEncoder:
     tokens = b"".join(self.vocab[idx] for idx in ids)
     return tokens.decode("utf-8")
   
-  def save(self, file_name):
+  def save(self, path):
     """
     Save the learned merges to a file with .pkl extension in ./data/save/.
     
     Args:
-        file_name (str): The name of the file with .pkl (Example: "merges.pkl")
+        path (str): The path and the name of the file with .pkl (Example: "data/merges.pkl")
     """
-    path = Path(__file__).resolve().parents[1] / "data" / "save" / file_name
     with open(path, "wb") as f:
       pickle.dump(self.merges, f)
     print(f"Merges sauvegardé avec succès dans {path}")
       
-  def load(self, file_name):
+  def load(self, path):
     """
     Load previously saved merges from a .pkl file.
 
     Args:
-        file_name (str): The name of the file with .pkl (Example: "merges.pkl")
+        path (str): The path and the name of the file with .pkl (Example: "data/merges.pkl")
     """
-    path = Path(__file__).resolve().parents[1] / "data" / "save" / file_name
     with open(path, "rb") as f:
       self.merges = pickle.load(f)
     self._create_vocab_with_merges()

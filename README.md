@@ -38,6 +38,31 @@ ids = tokenizer.encode("Hello world", mode="document")
 text = tokenizer.decode(ids)
 ```
 
+## Installation et utilisation du package
+
+### Installation depuis GitHub
+```bash
+pip install git+https://github.com/ad-tr/byte-pair-encoding-tokenizer
+```
+
+### Utilisation après installation
+```python
+from bpe import BytePairEncoder
+
+# Créer et entraîner un tokenizer
+tokenizer = BytePairEncoder()
+tokenizer.train(text="Votre corpus d'entraînement", vocab_size=512)
+tokenizer.save("/{path}/merges.pkl")
+
+# Charger un tokenizer existant
+tokenizer = BytePairEncoder.load("/{path}/merges.pkl")
+
+# Encoder et décoder
+ids = tokenizer.encode("Hello world", mode="document")
+text = tokenizer.decode(ids)
+print(f"Vocab size: {tokenizer.vocab_size}")
+```
+
 ## Features
 
 - Algorithme BPE classique
